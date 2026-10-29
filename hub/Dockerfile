@@ -4,9 +4,9 @@ FROM node:24-bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends sqlite3 ca-certificates && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY package.json package-lock.json ./
-# No install scripts: the hub needs neither the Prisma client nor a native build (better-sqlite3 ships prebuilt).
-RUN npm ci --ignore-scripts
+# Only the hub's four runtime packages (hub/package.json), not the app's tree. No install scripts: better-sqlite3 ships prebuilt.
+COPY hub/package.json ./package.json
+RUN npm install --ignore-scripts --no-audit --no-fund && npm cache clean --force
 
 COPY hub ./hub
 COPY src/lib/db/migrate.ts ./src/lib/db/migrate.ts

@@ -1,0 +1,13 @@
+{
+  "name": "mergeport-hub",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Runtime dependencies of the Mergeport hub image (the app's own package.json is not needed to run the hub)",
+  "engines": { "node": ">=24.0.0 <25" },
+  "dependencies": {
+    "better-sqlite3": "^13.0.3",
+    "ws": "^8.22.0",
+    "zod": "^4.6.7",
+    "tsx": "^4.20.6"
+  }
+}
