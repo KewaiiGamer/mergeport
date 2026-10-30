@@ -6,6 +6,12 @@ import { useEffect, useRef } from "react";
 const DEBOUNCE_MS = 400;
 const MAX_WAIT_MS = 4000;
 const MIN_GAP_MS = 3000;
+/**
+ * A teammate's edit that just arrived (reason "pulled") is what a person is waiting to see, and on a hub server it comes in over the
+ * live link within milliseconds. It gets a much shorter debounce and gap than the "state" bursts of background jobs, which stay throttled.
+ */
+const PULLED_DEBOUNCE_MS = 100;
+const PULLED_MIN_GAP_MS = 600;
 
 /**
  * Keeps the open page current without a manual reload: listens for change events from the local server (a teammate's
@@ -39,11 +45,13 @@ export function LiveRefresh() {
       lastRefresh.current = Date.now();
       router.refresh();
     };
-    const schedule = () => {
+    const schedule = (urgent = false) => {
       const now = Date.now();
       if (!firstEvent.current) firstEvent.current = now;
       if (timer.current) clearTimeout(timer.current);
-      const wait = Math.min(Math.max(DEBOUNCE_MS, lastRefresh.current + MIN_GAP_MS - now), Math.max(0, firstEvent.current + MAX_WAIT_MS - now));
+      const debounce = urgent ? PULLED_DEBOUNCE_MS : DEBOUNCE_MS;
+      const gap = urgent ? PULLED_MIN_GAP_MS : MIN_GAP_MS;
+      const wait = Math.min(Math.max(debounce, lastRefresh.current + gap - now), Math.max(0, firstEvent.current + MAX_WAIT_MS - now));
       timer.current = setTimeout(refreshNow, wait);
     };
     const connect = () => {
@@ -56,7 +64,8 @@ export function LiveRefresh() {
         try {
           const msg = JSON.parse(e.data) as { hello?: boolean; reason?: string };
           if (msg.hello) return;
-          if (msg.reason === "pulled" || msg.reason === "pushed" || msg.reason === "state") schedule();
+          if (msg.reason === "pulled") schedule(true);
+          else if (msg.reason === "pushed" || msg.reason === "state") schedule();
         } catch {
           /* ignore malformed event */
         }

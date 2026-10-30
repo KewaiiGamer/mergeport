@@ -1,0 +1,12 @@
+node_modules
+.next
+.data
+.git
+.claude
+.env
+.env.local
+*.log
+src/generated
+coverage
+test-results
+docs/screenshots

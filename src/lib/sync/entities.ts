@@ -1,4 +1,5 @@
 import type { Prisma, Space } from "@/generated/prisma/client";
+import { refreshHubWatch } from "@/lib/hub/watch";
 import type { Db } from "@/lib/db";
 import { createColumnsForProject } from "@/lib/services/planning";
 import type { Data } from "./merge";
@@ -63,6 +64,7 @@ const repo: EntityDef = {
       if (r && r.spaceId === ctx.space.id) {
         await db.repository.update({ where: { id: r.id }, data: { trackingStatus: "REMOVED", spaceId: null } });
         await db.repositoryGrant.updateMany({ where: { repositoryId: r.id, revokedAt: null }, data: { revokedAt: new Date() } });
+        refreshHubWatch();
       }
       return;
     }
@@ -81,6 +83,7 @@ const repo: EntityDef = {
       create: { memberId: ctx.localMemberId, repositoryId: r.id, grantedById: ctx.localMemberId, canManageWork: ctx.space.canWrite, canReview: ctx.space.canWrite },
       update: { revokedAt: null, canManageWork: ctx.space.canWrite, canReview: ctx.space.canWrite },
     });
+    refreshHubWatch();
   },
 };
 

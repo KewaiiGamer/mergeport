@@ -41,7 +41,7 @@ export class IdentityError extends Error {
 }
 
 const MAX_OUTPUT = 64 * 1024 * 1024;
-const INHERITED_TOKENS = ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"];
+const INHERITED_TOKENS = ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "MERGEPORT_LAUNCH_TOKEN"];
 
 /** Where `gh` usually lives when it is installed but the current process was started before PATH was updated. */
 export function ghCandidates(e: NodeJS.ProcessEnv = process.env, platform: NodeJS.Platform = process.platform): string[] {

@@ -1,5 +1,6 @@
 import path from "node:path";
 import type { Db } from "@/lib/db";
+import type { Backend } from "@/lib/local/backends";
 
 /**
  * A local profile = one SQLite file for one (host, GitHub account id). Credentials, caches and pending edits are
@@ -15,8 +16,12 @@ export class AccountMismatchError extends Error {
 }
 
 export const mergeportHome = (override?: string) => override ?? path.join(process.env.USERPROFILE ?? process.env.HOME ?? ".", ".mergeport");
-export const profileDirName = (host: string, accountId: bigint) => `${host.replace(/[^a-z0-9.-]/gi, "_")}-${accountId}`;
-export const profileDbPath = (home: string, host: string, accountId: bigint) => path.join(home, "profiles", profileDirName(host, accountId), "mergeport.db");
+/** GitHub profiles keep their original folder name; a hub profile is the same name plus `-hub-<fingerprint>`. */
+export const profileDirName = (host: string, accountId: bigint, backend: Backend = "github") => {
+  const base = `${host.replace(/[^a-z0-9.-]/gi, "_")}-${accountId}`;
+  return backend === "github" ? base : `${base}-${backend}`;
+};
+export const profileDbPath = (home: string, host: string, accountId: bigint, backend: Backend = "github") => path.join(home, "profiles", profileDirName(host, accountId, backend), "mergeport.db");
 
 /** Creates the single local workspace, user and member for this profile, or verifies the stored one matches. */
 export async function ensureLocalProfile(db: Db, who: LocalIdentity) {

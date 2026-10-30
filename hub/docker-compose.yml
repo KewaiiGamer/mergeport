@@ -1,0 +1,29 @@
+# Run from this directory:  docker compose up -d --build
+# The proxy (Nginx Proxy Manager, Caddy, ...) must be attached to nginx_mergeport_network; no host port is published.
+name: mergeport-hub
+
+services:
+  hub:
+    image: mergeport-hub:latest
+    build:
+      context: ..
+      dockerfile: hub/Dockerfile
+    container_name: mergeport-hub
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      MERGEPORT_HUB_TRUST_PROXY: "true"
+      MERGEPORT_HUB_BIND_HOST: "0.0.0.0"
+      MERGEPORT_HUB_DATA: /data
+      MERGEPORT_HUB_PORT: "8787"
+    volumes:
+      - mergeport_hub_data:/data
+    networks:
+      - nginx_mergeport_network
+
+volumes:
+  mergeport_hub_data:
+
+networks:
+  nginx_mergeport_network:
+    external: true

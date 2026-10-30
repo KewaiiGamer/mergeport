@@ -43,6 +43,8 @@ Demo mode keeps its own database under `~/.mergeport/demo/`. Everything in it is
 
 Create, invite and join are in the app (**Team**). Creating a team shows the exact repository name, owner, visibility and permissions first and does nothing until you confirm. See `docs/architecture.md`.
 
+Teams can alternatively run their own small **hub server** (one Node process and one SQLite file) instead of GitHub repositories for Mergeport-owned data; see `hub/README.md` to host one.
+
 ### Reviewing code
 
 Pull requests open on **Conversation**, **Files changed** and **Commits** tabs that switch instantly (the diff is fetched once, cached by commit, and warmed in the background). The diff looks like GitHub's: a file tree, unified or split layout, line numbers on both sides, Primer syntax colours in light and dark, expandable context between hunks, per-file **Viewed** marks that reset when the file changes again, each commit reviewable on its own, existing inline comments, and new inline comments posted to GitHub as you. **Repositories → Browse code** opens any tracked repository at any branch with a folder view, README, and highlighted files with line anchors. Code blocks in Markdown use the same colours.
@@ -58,6 +60,10 @@ Pull requests open on **Conversation**, **Files changed** and **Commits** tabs t
 3. Review one and confirm. Projects, cards, review rules, waiting rules, fork mappings and the shared repository list then arrive on their own and stay in sync. Nothing is joined without that confirmation.
 
 Repositories the team shares are matched to your own GitHub access; a repository you cannot read shows up as shared but unavailable to you.
+
+### Workspaces and connecting to a server
+
+The top bar has a workspace switcher. Each workspace (GitHub, or a team server) is a separate local profile, so data never mixes. To use a team server, choose **Connect to a server** on the sign-in card, enter its address and approve the GitHub code it shows. Mergeport must be signed in to `gh` as that same GitHub account. Switching restarts the app in place and shows a short "switching" overlay. See `docs/architecture.md`.
 
 ## Commands
 

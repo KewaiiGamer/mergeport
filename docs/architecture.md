@@ -73,6 +73,51 @@ The common space is `mergeport-<team>-workspace`; a restricted space is `mergepo
 
 **Source access** is separate: seeing a shared repository does not give a teammate its issues. Where a person cannot read the source repository the UI says "Source repository access required".
 
+## Workspaces and hub profiles
+
+A **profile** is one SQLite file for one `(host, GitHub account id, backend)`. `backend` is `github` or `hub-<fingerprint>`, where the fingerprint is the first 16 hex chars of SHA-256 over the normalized hub origin (`src/lib/local/backends.ts`; `http://` only for loopback). GitHub profiles keep their old folder name (`<host>-<accountId>`); a hub profile adds `-<backend>`. Two backends therefore never share a database, cache or outbox.
+
+Two small registry files live in the Mergeport home (`src/lib/local/registry.ts`, atomic temp-file-then-rename writes). Neither holds tokens or sessions.
+
+- `active.json`: `{ host, accountId, backend }`, the profile the launcher opens next.
+- `hubs.json`: known servers, `{ origin, teamName, lastSignedInAs, addedAt }[]`, used by the switcher.
+
+**Supervisor and control channel** (`src/lib/local/supervisor.ts`, driven by `scripts/start-local.ts`). The launcher owns the app child process. It listens on a loopback control port; the app gets the address through `MERGEPORT_CONTROL_URL` and authenticates each request with its own `MERGEPORT_LAUNCH_TOKEN`, which the supervisor compares (constant time) with the current child's token and refuses with 403 otherwise, so a previous child or anything that captured an old token cannot switch. Switching is fire-and-poll:
+
+1. The app POSTs `/switch` `{ backend }` to the control channel. The supervisor first checks `resolveTarget`; a failure there is a 409 and nothing is killed. Otherwise it generates the one-time token and replies **202** `{ launchUrl, previousBootId }`, waits `killDelayMs` (default 400) so the response reaches the browser, kills the old child, then starts the new one. A different switch already running is also 409. `/api/local/switch` maps every launcher refusal to 409.
+2. A boot failure AFTER the 202 has no HTTP error. The supervisor restores the previous child, so the browser sees a new `bootId` with a different backend and the overlay returns to `/`. If no child can be started at all, the overlay times out after 60 s with a banner. The launcher logs the failure through the supervisor's `switch-failed` event and exits when no child is left. If the old child cannot be killed (kill times out), the supervisor keeps its handle and refuses further switches ("The previous workspace did not stop") rather than start a second child.
+3. The launcher, not the app, writes `active.json` in its `onSwitched` callback once the new child is up. Because that happens after the switch, `currentBackend()` and the switcher prefer `MERGEPORT_BACKEND` (set by the launcher for every child, including the first) and fall back to `active.json` only when it is unset (no launcher).
+4. `SwitchingOverlay` (a portal over the current page, not a separate `/switching` route) polls `GET /api/local/ready`, which returns `{ bootId, backend }`. A new `bootId` with the target backend navigates to `launchUrl` (the new app consumes that one-time launch link); a new `bootId` with another backend returns to `/`. With `previousBootId` null, the first success before any error counts as the old process and a success after an error as the new one. While the old process is gone the poll simply fails and retries; after 60 s the overlay shows the timeout banner.
+
+**Connect to a server** (sign-in card, `src/lib/hub/connect.ts`). Enter the hub address; the app normalizes it and checks `GET /health`, then runs the hub's GitHub device flow (user code and verification URL shown, polled until approved; cancel stops the poll). The hub returns a session token and the member's numeric GitHub id. `completeConnect` requires `gh` to be signed in as that **same numeric id** (and host), otherwise creates nothing. On success it creates the profile database, stores the session through the session port, marks the profile, upserts `hubs.json`, writes `active.json`, and the UI switches to it.
+
+**Hub Team page.** In a hub profile `/team` is served by `HubTeamService` over a hub admin port: members with roles (owner, admin, member, reader), invite, role change, remove, and space membership including restricted spaces. A 401 from the hub asks to sign in again, a 403 says access was removed or refused, and connection state (live, reconnecting, offline, pending edits) comes from the link-status port. Authority is always the hub's answer; a cached "denied" is re-checked and cleared after mutations.
+
+**Backend isolation.** `assertBackendMatch(config, space)` (`src/lib/local/backend-guard.ts`) refuses to open a `GITHUB` space in a hub profile and the reverse.
+
+### Hub integration (done)
+
+The hub UI was built against ports (`src/lib/hub/ports.ts`); `src/lib/hub/ports-impl.ts` now implements them on the real storage and the real hub API:
+
+- `hubSessionPort` keeps the token encrypted in the profile's `HubSession` row (`src/lib/hub/session-vault.ts`, key file `key` beside the db) and `markProfile` writes `TeamConfig { mode: TEAM, backend: HUB, hubOrigin }`.
+- `httpHubAdmin` speaks `hub/src/{auth-routes,admin-routes}.ts` (`POST /admin/invites { githubLogin, role }` resolves the login to its numeric GitHub id through `GET /users/{login}` with the OAuth App's Basic credentials and stores `invite.github_id`; sign-in matches an invite by id, by login only for legacy rows with no id; `POST /admin/spaces` answers `{ space }`).
+- `hubLinkStatus` reads the running process's `HubLink` state (registered by `getEngine()` in `src/lib/local/runtime.ts`) plus the count of `PENDING`/`CONFLICT` outbox ops in hub spaces.
+- `getEngine()` reads `TeamConfig`: on `backend = HUB` it builds the engine with an `HttpHubClient` and starts `startHubLive`; a GitHub profile keeps the GitHub store unchanged.
+- `tests/hub-e2e.test.ts` runs two local clients against the real in-process hub (`tests/hub/harness.ts`).
+
+Still open: `currentBackend()` in `src/lib/local/workspaces.ts` reads `MERGEPORT_BACKEND`/`active.json`, not `TeamConfig`; `assertBackendMatch` is not yet called from the `SyncEngine`.
+
+### Manual verification (spec) not yet run
+
+None of these has been run. Only automated tests with a fake hub exist (`tests/fake-hub.ts`, `tests/profile-switch.test.ts`).
+
+- [ ] Hub behind Caddy with real TLS
+- [ ] Two real GitHub accounts (owner and teammate)
+- [ ] Invite the second account
+- [ ] Second account joins
+- [ ] Edit on one side, see it on the other
+- [ ] Remove the member and confirm access ends
+
 ## Sync
 
 Each person's database holds the working copy. `SyncEngine` (`src/lib/sync/engine.ts`) reconciles it with each space:
@@ -92,6 +137,56 @@ Per-space state shown to the person: **Pending, Syncing, Synced, Offline, Confli
 **Revoked access.** On `403/404` for a space the engine stops reading and writing it, quarantines unsent operations (`QUARANTINED`), and purges cached rows that came from it. The person can retry the sent operations if access returns or discard them. Git history on GitHub is not erased and the UI says so.
 
 **Schema skew.** A space or entity file with a newer schema is read-only (`SCHEMA_NEWER`); unknown entity files are skipped and never rewritten by an older client.
+
+## Hub webhook relay (server)
+
+The hub can relay GitHub webhooks (`hub/src/webhook-routes.ts`, `hub/src/settings.ts`, `GithubRelay` in `hub/src/notify.ts`). `POST /webhooks/github` is authenticated only by the HMAC-SHA256 signature (`X-Hub-Signature-256`) over the raw body (1 MiB cap) with the GitHub App's webhook secret, stored in the hub's `setting` table (owner-only `PUT`/`DELETE /admin/github-webhook`; env fallback `MERGEPORT_HUB_GITHUB_WEBHOOK_SECRET`). A verified delivery is parsed in memory, deduplicated by `X-GitHub-Delivery` for 10 minutes, and sent as `{t:"gh",repoId,event,delivery,payload}` to each WebSocket connection that listed the repository in its `{t:"watch",repos}` message and may see it (public repository, the member owns it, or it is shared through a space the member can read). Nothing from a delivery is stored or logged, and the apps keep their 15-minute cycle as the safety net. Design: `docs/superpowers/specs/2026-10-30-github-webhook-instant-updates-design.md`.
+
+## Hub backend (client)
+
+A team may sync through a Mergeport hub (HTTP plus WebSocket) instead of a GitHub coordination repository. This section describes the client half that exists in `src/lib/hub/` and `src/lib/sync/engine.ts`. It is not wired into the running app yet (see "What plan 3 must wire").
+
+**Transport abstraction.** `src/lib/hub/types.ts` defines `HubClient` (`me`, `pull(spaceId, since)`, `snapshot(spaceId)`, `push(spaceId, ops)`) and `Backend = { kind: "github"; store } | { kind: "hub"; client }`. `SyncEngine.backendOf(space)` picks the backend from `Space.backend` (`GITHUB` or `HUB`). `pull` and `push` dispatch on `space.backend` to `pullHub`/`pushHub` or `pullGithub`/`pushGithub`; the GitHub path is the former `pull`/`push` moved unchanged, and `tests/team-sync.test.ts` and `tests/review-fixes.test.ts` are untouched. `EngineDeps` gained `hub?: (space) => HubClient` and `hubLive?: () => boolean`; without `hub`, a hub space throws "No hub client configured". `HttpHubClient` (`src/lib/hub/client.ts`) is the implementation; `normalizeHubOrigin` accepts only https, or http on loopback.
+
+**Pull by cursor.** `Space.hubCursor` (BigInt) is the last hub `seq` applied. `pullHub` pages `pull(spaceId, since)` while `more` is set. Only the newest event per entity is applied (the event carries the whole entity), through the same three-way merge and guards as a GitHub pull. The cursor is stored only after entities are applied; if one entity cannot be applied the cursor stays just before it so the next pull retries.
+
+**410 and snapshot resync.** The hub answers `410` when the cursor predates its retained history; `HttpHubClient.pull` maps that to `"gone"`. `pullHub` also resyncs when the hub answers with `seq` lower than the local cursor (hub restored from backup or rebuilt). Both cases fetch `snapshot(spaceId)`, apply it, and set the cursor to the snapshot `seq`. Entities tracked locally (`SyncEntity`, not deleted) but absent from the snapshot are treated as vanished and removed through the same path as a remote delete. **Restored hubs.** The hub also answers `410` with `reason: "history"` when the op the client last read at its cursor (`Space.hubCursorOp`) is not the op the hub holds at that position, and every pull and snapshot carries a per-process `epoch` (`Space.hubEpoch`). A snapshot taken because of a restore (`restored: "certain"` for a seq or history mismatch, `"suspected"` for a new epoch) first runs `collectRestoreLoss`: entities with unsent edits are counted as kept and merged by `reconcile` as usual, and clean local copies about to be replaced are written to a `HubRestore` row (capped detail, `resend` only for copies provably newer than the hub's). After a suspected restore only provable regressions are recorded, because a restarted hub that is simply ahead is an ordinary remote edit. The Sync page lists open `HubRestore` rows with "Send my copies again" (`resendRestored`, ordinary PENDING ops against the hub's current versions) and "Keep the server's version" (`dismissRestored`); the top bar shows them like conflicts.
+
+**Push with per-op results.** `pushHub` sends pending `OutboxOp`s as `Op[]` (`opId` is the outbox id, so a retry is idempotent) and gets one `OpResult` per op: `applied` (settle base at the returned version, delete the op), `duplicate` (already applied, delete the op), `stale` (the hub returns `current`). A missing result puts the op back to PENDING. For `stale` the engine reconciles `current` with the local row (three-way merge), which rewrites the op, and retries immediately, up to **3 rounds** per cycle so a hot entity cannot spin. A `stale` without `current` just rebases `baseVersion`; a `current` with a newer schema blocks the entity (`SCHEMA_NEWER`). A thrown error returns ops to PENDING; a failure while recording results does too (never stranded in SENT).
+
+**Errors.** `HubError` has `kind` (`network`, `auth`, `forbidden`, `not-found`, `rate-limited`, `schema`, `unknown`), optional `status` and `retryAfterSeconds`. `handleHubError`: network sets "offline" and backs off; auth sets "Sign in to the server again"; `not-found` on read or write, and `forbidden` on read, revoke the space (same purge and quarantine as GitHub); `forbidden` on write drops to read-only and quarantines unsent ops; `rate-limited` sets `rateLimitedUntil`.
+
+**Live link.** `HubLink` (`src/lib/hub/link.ts`) owns one WebSocket at `<origin>/ws` (http becomes ws). The token travels only in the subprotocols `["mergeport.v1", "bearer.<token>"]`, never in the URL. Reconnect backoff is `1000 * 2^failures` ms, times a `0.5 + random()` jitter, with the result capped at 30 s (the cap includes the jitter); state is `reconnecting` for the first failures and `offline` from the third. A ping `{t:"ping"}` is sent every 25 s. Messages: `hello` (resets backoff, state `live`, `onHello`), `changed` (debounced per space for 100 ms into one callback with the highest seq), `access` (`added`/`removed`/`deleted`), `team`, `bye`. Close code `4403` means this member was removed: state `removed`, no reconnect. `bye` with reason `shutdown` is an ordinary drop and reconnects; any other `bye` reason is treated as removal. A missing token gives state `signed-out`. Malformed messages are ignored.
+
+**`startHubLive`.** `src/lib/hub/live.ts` wires a `HubLink` to the engine and returns `{ link, live(), stop() }`. On `hello` it runs `me()` + `syncHubSpaces` and syncs every hub space. On `changed` it syncs that space (one cycle at a time per space, one extra queued if a notification arrives mid-cycle, a few short retries while the cursor has not reached the announced seq). `access added` refreshes spaces; `removed`/`deleted` revokes that space; state `removed` revokes every hub space. A **60 s poll is always on**: while the link is not live it refreshes and syncs all hub spaces; while live it only syncs spaces that look unhealthy (`lastError` set, `rateLimitedUntil` expired, or `hubCursor` below the last announced seq), so a failed cycle or exhausted retry cannot leave a live space stale. On start, ops left `SENT` for hub spaces are reset to `PENDING` (the hub answers `duplicate`). `engine.tick()` skips hub spaces while `hubLive()` is true, and otherwise polls them with a 60 s base that `schedule()` backs off; `expectedConsistencyDelaySeconds(poll, { live })` returns "about 1 s (live)" or "up to 1 min (reconnecting)".
+
+**Spaces.** `syncHubSpaces(db, engine, me)` creates or updates local `Space` rows from `GET /me`, revokes spaces the hub no longer lists, restarts the cursor at 0 for a space that comes back after revocation, and upserts `TeamConfig` (`backend: HUB`, `commonSpaceId`). `canAdmin` is always false for hub spaces. `checkHubHealth(origin, supportedSchema = 1)` reads `/health` and refuses a hub with a newer schema, a `publicUrl` that differs from the typed address, or a GitHub host other than `github.com`.
+
+**Encrypted session store.** `src/lib/hub/session-vault.ts`. `openVault(keyFile)` creates or reads a 32-byte key file (written private, hard-linked into place so concurrent creators agree; best-effort `icacls` restriction on Windows; a wrong-sized file is an error, never silently replaced). The vault encrypts with AES-256-GCM and a random 12-byte IV, stored as `v1.<iv>.<tag>.<data>` (base64). `saveHubSession` / `loadHubSession` / `clearHubSession` keep one `HubSession` row (`id = "session"`: `origin`, `cipher`, `githubId`, `login`). `loadHubSession` returns `null` when decryption fails (key lost or changed), which means signing in again. The key file in the profile directory (`key`, beside `mergeport.db`) protects the hub session token against accidental disclosure: copying the database on its own, a backup of the database alone, or a log or bug report that includes it, none of which can decrypt the token without the key. It does not protect against another process running as the same OS user, which can read both files just as Mergeport does. The upgrade path with real isolation is the operating system keychain (Keychain, Credential Manager, Secret Service), which the project has not adopted because it needs a native dependency. The key file is never copied or exported with a profile: `saved-profiles.ts` only reads `mergeport.db`, and `scripts/migrate-from-postgres.ts` writes a fresh database. "Sign out of this server" on the hub Team page deletes the `HubSession` row (`hubSessionPort.remove` -> `clearHubSession`).
+
+**Schema changes** (migration `20261030130000_hub_client`). Enums `SpaceBackend` and `TeamBackend` (`GITHUB`, `HUB`); `Space.backend`, `Space.hubSpaceId` (empty for GitHub), `Space.hubCursor`; the unique key on `Space` becomes `[backend, repoOwner, repoName, hubSpaceId]`; `TeamConfig.backend`, `TeamConfig.hubOrigin`; table `HubSession`. Existing rows default to `GITHUB`.
+
+**Test strategy.** The hub server is not in this repository, so `tests/hub-client/fake-hub.ts` (`FakeHub`) is a real local HTTP server plus in-memory `FakeSocket`s that implements `/health`, `/me`, entities pull (with `410`, paging, `seq` regression), snapshot, ops (per-op results, stale), and failure injection. `tests/hub-client/harness.ts` (`makeHubClient`) builds an isolated database, `HttpHubClient`, engine and optional `startHubLive` per simulated member. Link timing tests use manual timers (`manual-timers.ts`). Suites: `client`, `dispatch`, `link`, `schema`, `session-vault`, `spaces` in `tests/hub-client/`, and `tests/hub-sync.test.ts` for pull, push, live and revocation end to end.
+
+### What plan 3 must wire
+
+Nothing below exists in the running app yet; the engine and `src/lib/hub/` are complete and tested only through the harness.
+
+- `src/lib/local/runtime.ts` `getEngine()`: pass `hub: (space) => client` (an `HttpHubClient` for the saved origin whose `getToken` reads the stored session) and `hubLive: () => live?.live() ?? false` into `EngineDeps`. Today it passes only `store`.
+- Call `startHubLive({ db, engine, client, origin, getToken })` after sign-in and at start-up when a session exists; keep the handle and call `stop()` on sign-out or profile switch.
+- Vault key path: `<profile dir>/key`, passed to `openVault`.
+- Load the session with `loadHubSession(db, vault)` at start; `saveHubSession` after sign-in; `clearHubSession` on sign-out. `null` from load means sign in again.
+- Call `checkHubHealth(origin)` when the user connects to a hub, before storing anything.
+- Call `syncHubSpaces(db, engine, await client.me())` after connect (live does it on `hello`).
+- A `HubTeamService` (team/member management against the hub) does not exist; `TeamService` is GitHub-only.
+- Sign-in UI, profile switching, and surfacing `HubLinkState` / `expectedConsistencyDelaySeconds(.., { live })` in the UI.
+
+### Hub client limitations
+
+- A stale op that can never merge (cross-space or blocked entity) is re-sent every cycle, as in the GitHub path.
+- Conflict ops are not considered when deciding that an entity vanished from a snapshot (mirrors GitHub).
+- Session key storage needs a filesystem that supports hard links.
+- Hub spaces are never admin spaces locally; role and membership come from the hub.
 
 ## Scheduler
 

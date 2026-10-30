@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState, useTransition, type FormEvent, type ReactNode } from "react";
 import type { ActionResult } from "@/lib/action-result";
 import { CircleAlert, LoaderCircle } from "@/components/ui/icons";
+import { useSheetClose } from "@/components/ui/dialog";
 import { CopyField } from "./CopyField";
 
 /**
@@ -18,6 +19,7 @@ export function ActionForm({
   pendingLabel = "Working…",
   className,
   resetOnSuccess = true,
+  closeOnSuccess = false,
   onDone,
   secondary,
   success,
@@ -30,6 +32,8 @@ export function ActionForm({
   pendingLabel?: string;
   className?: string;
   resetOnSuccess?: boolean;
+  /** Inside a Sheet: close the dialog after a successful submit. A failure keeps it open with the input intact. */
+  closeOnSuccess?: boolean;
   onDone?: (r: ActionResult) => void;
   secondary?: ReactNode;
   /** Server Components cannot pass functions, so the success output is described as data. */
@@ -44,6 +48,7 @@ export function ActionForm({
   const ref = useRef<HTMLFormElement>(null);
   const row = useRef<HTMLDivElement>(null);
   const [slow, setSlow] = useState(false);
+  const closeSheet = useSheetClose();
 
   // Real pending work only: after a few seconds say so in words, so a slow network is not mistaken for a dead button.
   useEffect(() => {
@@ -78,6 +83,7 @@ export function ActionForm({
       setResult(r);
       setSeq((n) => n + 1);
       if (r.ok && resetOnSuccess) ref.current?.reset();
+      if (r.ok && closeOnSuccess) closeSheet?.();
       onDone?.(r);
     });
   }

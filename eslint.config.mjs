@@ -5,7 +5,7 @@ import nextTs from "eslint-config-next/typescript";
 export default defineConfig([
   ...nextVitals,
   ...nextTs,
-  globalIgnores([".next/**", "src/generated/**", "node_modules/**", ".data/**", ".impeccable/**", "next-env.d.ts"]),
+  globalIgnores([".next/**", ".claude/**", "src/generated/**", "node_modules/**", ".data/**", ".impeccable/**", "next-env.d.ts"]),
   {
     rules: {
       // Prisma's `any` JSON and GitHub payloads are typed at the boundary, not everywhere.

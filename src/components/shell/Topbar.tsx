@@ -5,6 +5,8 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { Bell, ChevronRight, LayoutDashboard, LogOut } from "@/components/ui/icons";
 import { ThemeToggle } from "@/components/shell/ThemeControls";
+import { WorkspaceSwitcher } from "@/components/shell/WorkspaceSwitcher";
+import type { WorkspaceEntry } from "@/lib/local/workspaces";
 import { Tip } from "@/components/ui/Tooltip";
 import { Metric } from "@/components/ui/Metric";
 import { SyncBadge, type SyncStateName } from "@/components/sync/SyncBadge";
@@ -31,7 +33,7 @@ const LABELS: Record<string, string> = {
   search: "Search",
 };
 
-export function Topbar({ unread, menu, syncNote, theme, sync }: { unread: number; menu: React.ReactNode; syncNote?: string; theme: ThemePreference; sync: { state: SyncStateName; pending: number; conflicts: number; detail?: string | null; scope?: "source" } | null }) {
+export function Topbar({ unread, menu, syncNote, theme, sync, workspaces }: { unread: number; menu: React.ReactNode; syncNote?: string; theme: ThemePreference; sync: { state: SyncStateName; pending: number; conflicts: number; detail?: string | null; scope?: "source" } | null; workspaces?: { entries: WorkspaceEntry[]; active: string; switchable: boolean } | null }) {
   const path = usePathname();
   const parts = path.split("/").filter(Boolean);
   const crumbs = parts.map((p, i) => ({ href: "/" + parts.slice(0, i + 1).join("/"), label: LABELS[p] ?? (p.length > 16 ? "Detail" : p) }));
@@ -58,6 +60,7 @@ export function Topbar({ unread, menu, syncNote, theme, sync }: { unread: number
           ))}
         </ol>
       </nav>
+      {workspaces ? <WorkspaceSwitcher {...workspaces} /> : null}
       {syncNote && <span className="hidden text-[12px] text-ink-3 md:inline">{syncNote}</span>}
       {sync && <SyncBadge {...sync} href="/sync" />}
       <ThemeToggle initial={theme} />

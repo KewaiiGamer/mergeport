@@ -11,7 +11,9 @@ export function savedProfiles(home: string, host: string): SavedProfile[] {
   const prefix = profileDirName(host, 0n).replace(/0$/, "");
   let dirs: string[] = [];
   try {
-    dirs = fs.readdirSync(root).filter((d) => d.startsWith(prefix));
+    // Hub profiles sit beside these as `<host>-<id>-hub-<fp>`; only plain `<host>-<id>` is a GitHub profile.
+    const own = new RegExp(`^${prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\d+$`);
+    dirs = fs.readdirSync(root).filter((d) => own.test(d));
   } catch {
     return [];
   }

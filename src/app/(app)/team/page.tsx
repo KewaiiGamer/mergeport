@@ -17,15 +17,24 @@ import { Link, Lock, Mail, ShieldCheck, Users } from "@/components/ui/icons";
 import { SyncBadge } from "@/components/sync/SyncBadge";
 import { leaveTeamAction, acceptGithubInvitationAction, createSpaceAction, createTeamAction, inviteAction, revokeAccessAction } from "@/app/team-actions";
 import { env } from "@/lib/env";
+import { isHubBackend } from "@/lib/local/backends";
+import { currentBackend } from "@/lib/local/workspaces";
+import { HubTeamPage } from "@/components/team/HubTeamPage";
 
 export const metadata = { title: "Team" };
 export const dynamic = "force-dynamic";
 
-type SP = { name?: string; owner?: string; invite?: string; users?: string; perm?: string };
+type SP = { name?: string; owner?: string; invite?: string; users?: string; perm?: string; "github-app"?: string; reason?: string };
 
 export default async function TeamPage({ searchParams }: { searchParams: Promise<SP> }) {
   const { viewer } = await requireViewer();
+  const backend = await currentBackend();
   const sp = await searchParams;
+  if (isHubBackend(backend)) {
+    // `?github-app=created` or `?github-app=failed&reason=<code>`: where the GitHub App callback sends the owner back.
+    const result = sp["github-app"] === "created" || sp["github-app"] === "failed" ? sp["github-app"] : null;
+    return <HubTeamPage backend={backend} githubApp={result ? { result, reason: sp.reason } : null} />;
+  }
   const demo = isDemo();
   const cfg = await db.teamConfig.findUnique({ where: { id: "team" } });
   const spaces = await db.space.findMany({ orderBy: [{ kind: "asc" }, { createdAt: "asc" }] });

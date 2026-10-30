@@ -1,5 +1,6 @@
 "use server";
 
+import { commonSpaceIdForSharing } from "@/lib/services/project-sharing";
 import { applyAutoSetup } from "@/lib/services/auto-setup";
 import { setProjectReviewers } from "@/lib/services/project-reviewers";
 import { notifyChange } from "@/lib/local/runtime";
@@ -262,12 +263,14 @@ export async function createProjectAction(fd: FormData): Promise<ActionResult> {
     const { viewer } = await requireAdminViewer();
     const name = str(fd, "name");
     if (!name) throw new ValidationError("Name the project");
-    const p = await db.project.create({ data: { workspaceId: viewer.workspaceId, name, slug: slugify(name), description: str(fd, "description") || null } });
+    // Resolved before anything is created, so a share that cannot happen never leaves a half-made project behind.
+    const spaceId = str(fd, "share") ? await commonSpaceIdForSharing(db) : null;
+    const p = await db.project.create({ data: { workspaceId: viewer.workspaceId, name, slug: slugify(name), description: str(fd, "description") || null, spaceId } });
     await createColumnsForProject(db, p.id);
     if (str(fd, "reviewers")) await setProjectReviewers(db, viewer.workspaceId, p.id, p.name, str(fd, "reviewers"));
     await audit(db, viewer, "project.create", { type: "Project", id: p.id });
     revalidatePath("/admin/projects");
-    return { ok: true, message: "Project created" };
+    return { ok: true, message: spaceId ? "Project created and shared with the team" : "Project created" };
   });
 }
 

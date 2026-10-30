@@ -153,6 +153,24 @@ export async function releaseQuarantineAction(fd: FormData): Promise<ActionResul
   });
 }
 
+export async function resendRestoredAction(fd: FormData): Promise<ActionResult> {
+  return run(async () => {
+    await requireViewer();
+    const { queued } = await (await engine()).resendRestored(str(fd, "id"));
+    revalidatePath("/sync");
+    return { ok: true, message: queued ? `${queued} item(s) queued to send to the server again` : "Nothing to send: those items were changed since." };
+  });
+}
+
+export async function dismissRestoredAction(fd: FormData): Promise<ActionResult> {
+  return run(async () => {
+    await requireViewer();
+    await (await engine()).dismissRestored(str(fd, "id"));
+    revalidatePath("/sync");
+    return { ok: true, message: "Dismissed" };
+  });
+}
+
 export async function setPollSecondsAction(fd: FormData): Promise<ActionResult> {
   return run(async () => {
     await requireViewer();

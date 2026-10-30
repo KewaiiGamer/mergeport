@@ -10,7 +10,7 @@ import { ActionForm } from "@/components/forms/ActionForm";
 import { SyncBadge } from "@/components/sync/SyncBadge";
 import { Banner, EmptyState, Mono, PageHeader, Panel, Time } from "@/components/ui/primitives";
 import { FolderGit2, RefreshCw, ShieldCheck } from "@/components/ui/icons";
-import { refreshSyncAction, releaseQuarantineAction, resolveConflictAction, setPollSecondsAction } from "@/app/team-actions";
+import { dismissRestoredAction, refreshSyncAction, releaseQuarantineAction, resendRestoredAction, resolveConflictAction, setPollSecondsAction } from "@/app/team-actions";
 
 export const metadata = { title: "Sync" };
 export const dynamic = "force-dynamic";
@@ -23,6 +23,7 @@ export default async function SyncPage() {
   const cfg = await db.teamConfig.findUnique({ where: { id: "team" } });
   const spaces = await db.space.findMany({ orderBy: { createdAt: "asc" } });
   const conflicts = await db.syncConflict.findMany({ where: { status: "OPEN" }, include: { space: true }, orderBy: { createdAt: "asc" } });
+  const restores = await db.hubRestore.findMany({ where: { status: "OPEN" }, include: { space: true }, orderBy: { at: "asc" } });
   const quarantined = await db.outboxOp.findMany({ where: { status: "QUARANTINED" }, include: { space: true } });
   const pendingOps = await db.outboxOp.findMany({ where: { status: { in: ["PENDING", "SENT", "FAILED"] } }, include: { space: true }, orderBy: { createdAt: "asc" }, take: 50 });
   const poll = cfg?.pollSeconds ?? 30;
@@ -106,6 +107,33 @@ export default async function SyncPage() {
           </ul>
         )}
       </Panel>
+
+      {restores.length > 0 && (
+        <div className="mt-5">
+          <Panel title={`Server restored from a backup (${restores.length})`} icon={ShieldCheck} id="restored">
+            <div className="flex flex-col gap-3 p-4 text-[13px]">
+              <p className="text-ink-3">The team server went back to an earlier copy of its data. Your computer now matches the server, so some of your newer saved copies were replaced. Edits you had not sent yet were kept. What was replaced is listed here so nothing is lost without you knowing.</p>
+              {restores.map((r) => {
+                const entries = r.detail as unknown as { type: string; entityId: string; deleted: boolean; data: Record<string, unknown>; resend: boolean }[];
+                const sendable = entries.filter((e) => e.resend).length;
+                return (
+                  <div key={r.id} className="flex flex-col gap-2 rounded-[10px] border border-line p-3">
+                    <span><strong>{r.rolledBack}</strong> item(s) replaced by the server&apos;s older copy{r.kept > 0 ? <>, <strong>{r.kept}</strong> with unsent edits kept</> : null}. Detected <Time value={r.at} formatted={formatInstant(r.at, viewer.timezone)} />.</span>
+                    <ul className="text-[12.5px] text-ink-3">
+                      {entries.slice(0, 8).map((e) => <li key={`${e.type}/${e.entityId}`}>{e.type} <Mono>{typeof e.data.title === "string" ? e.data.title : typeof e.data.name === "string" ? e.data.name : e.entityId}</Mono>{e.deleted ? " (you had deleted it)" : ""}</li>)}
+                      {r.rolledBack > Math.min(entries.length, 8) && <li>and {r.rolledBack - Math.min(entries.length, 8)} more</li>}
+                    </ul>
+                    <span className="flex flex-wrap gap-2">
+                      {sendable > 0 && <ActionForm action={resendRestoredAction} submitLabel={`Send my copies again (${sendable})`} submitAriaLabel="Send my newer copies to the server again" submitClassName="btn" resetOnSuccess={false}><input type="hidden" name="id" value={r.id} /></ActionForm>}
+                      <ActionForm action={dismissRestoredAction} submitLabel="Keep the server's version" submitAriaLabel="Dismiss this notice and keep the server's version" submitClassName="btn" resetOnSuccess={false}><input type="hidden" name="id" value={r.id} /></ActionForm>
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          </Panel>
+        </div>
+      )}
 
       {pendingOps.length > 0 && (
         <div className="mt-5"><Panel title={`Waiting to be sent (${pendingOps.length})`} icon={RefreshCw} id="outbox"><ul className="text-[12.5px]">{pendingOps.map((o) => <li key={o.id} className="flex items-center justify-between gap-3 border-b border-line px-4 py-2 last:border-b-0"><span><span className="font-medium">{o.kind === "DELETE" ? "Delete" : "Change"}</span> {o.entityType} in <Mono>{o.space.repoName}</Mono></span><span className="text-ink-3">{o.status.toLowerCase()}{o.error ? ` · ${o.error}` : ""}</span></li>)}</ul></Panel></div>

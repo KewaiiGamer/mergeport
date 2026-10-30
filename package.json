@@ -17,7 +17,8 @@
     "db:migrate:dev": "prisma migrate dev",
     "db:seed": "tsx prisma/seed.ts",
     "migrate:from-postgres": "tsx scripts/migrate-from-postgres.ts",
-    "test:live": "vitest run tests/live"
+    "test:live": "vitest run tests/live",
+    "hub": "node --import tsx hub/src/main.ts"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",
@@ -41,6 +42,7 @@
     "sanitize-html": "^2.17.0",
     "shiki": "^4.5.0",
     "tailwind-merge": "^3.3.1",
+    "ws": "^8.22.0",
     "zod": "^4.6.7"
   },
   "devDependencies": {
@@ -51,6 +53,7 @@
     "@types/react": "^19.2.2",
     "@types/react-dom": "^19.2.2",
     "@types/sanitize-html": "^2.16.0",
+    "@types/ws": "^8.18.2",
     "dotenv": "^17.2.3",
     "eslint": "^9.39.1",
     "eslint-config-next": "16.4.3",

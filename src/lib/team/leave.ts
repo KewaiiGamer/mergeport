@@ -1,4 +1,5 @@
 import type { Db } from "@/lib/db";
+import { COVERAGE_KEY } from "@/lib/hub/webhook-panel";
 
 /**
  * Stops using the current team on THIS computer: spaces are forgotten, shared repositories and projects become local again,
@@ -13,7 +14,7 @@ export async function leaveTeamLocally(db: Db): Promise<{ spaces: number }> {
     db.project.updateMany({ where: { spaceId: { not: null } }, data: { spaceId: null } }),
     db.space.deleteMany({}),
     db.teamConfig.upsert({ where: { id: "team" }, create: { id: "team", mode: "PERSONAL" }, update: { mode: "PERSONAL", teamRemoteId: null, name: null, ownerLogin: null, commonSpaceId: null } }),
-    db.discoveryCache.deleteMany({ where: { OR: [{ key: { startsWith: "inv-status:" } }, { key: { in: ["invitations", "candidates"] } }] } }),
+    db.discoveryCache.deleteMany({ where: { OR: [{ key: { startsWith: "inv-status:" } }, { key: { in: ["invitations", "candidates", COVERAGE_KEY] } }] } }),
   ]);
   return { spaces };
 }

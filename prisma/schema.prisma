@@ -836,6 +836,16 @@ enum TeamMode {
   TEAM
 }
 
+enum SpaceBackend {
+  GITHUB
+  HUB
+}
+
+enum TeamBackend {
+  GITHUB
+  HUB
+}
+
 /// A coordination space = one private GitHub repository with exactly one audience (its collaborators).
 model Space {
   id             String      @id @default(cuid())
@@ -861,12 +871,22 @@ model Space {
   lastError      String?
   rateLimitedUntil DateTime?
   createdAt      DateTime    @default(now())
+  backend        SpaceBackend @default(GITHUB)
+  /// Hub space id (empty for GitHub spaces).
+  hubSpaceId     String      @default("")
+  /// Last hub change sequence applied locally.
+  hubCursor      BigInt      @default(0)
+  /// The op the hub recorded at hubCursor: lets the hub tell that its history is no longer the one this cursor points into (a restore).
+  hubCursorOp    String      @default("")
+  /// The hub process this cursor was read from. A different one may be serving a restored database.
+  hubEpoch       String      @default("")
 
+  restores  HubRestore[]
   entities  SyncEntity[]
   outbox    OutboxOp[]
   conflicts SyncConflict[]
 
-  @@unique([repoOwner, repoName])
+  @@unique([backend, repoOwner, repoName, hubSpaceId])
 }
 
 /// What we last agreed on with the remote for one entity file: enables 3-way merges.
@@ -927,6 +947,23 @@ model SyncConflict {
   @@index([spaceId, status])
 }
 
+/// The hub's history stopped being the one this computer had followed (restored from a backup). What the hub's state replaced is kept here.
+model HubRestore {
+  id         String   @id @default(cuid())
+  spaceId    String
+  at         DateTime @default(now())
+  /// Entities whose local copy was newer than the restored hub (or absent from it) and were replaced by the hub's state.
+  rolledBack Int
+  /// Entities with unsent local edits: these were kept and merged against the restored state.
+  kept       Int
+  /// [{ type, entityId, deleted, data }]: the local copies that were replaced (capped).
+  detail     Json
+  status     String   @default("OPEN") // OPEN | RESENT | DISMISSED
+  space      Space    @relation(fields: [spaceId], references: [id], onDelete: Cascade)
+
+  @@index([spaceId, status])
+}
+
 model TeamConfig {
   id            String   @id @default("team")
   mode          TeamMode @default(PERSONAL)
@@ -935,5 +972,18 @@ model TeamConfig {
   ownerLogin    String?
   commonSpaceId String?
   pollSeconds   Int      @default(30)
+  backend       TeamBackend @default(GITHUB)
+  hubOrigin     String?
   updatedAt     DateTime @updatedAt
+}
+
+/// The one hub login of this client; `cipher` is the encrypted hub session token.
+model HubSession {
+  id        String   @id @default("session")
+  origin    String
+  cipher    String
+  githubId  BigInt
+  login     String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }

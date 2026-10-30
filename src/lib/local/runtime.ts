@@ -1,6 +1,10 @@
 import { EventEmitter } from "node:events";
 import type { Space } from "@/generated/prisma/client";
-import { db } from "@/lib/db";
+import { db, resolveDbFile } from "@/lib/db";
+import { HttpHubClient } from "@/lib/hub/client";
+import { startHubLive } from "@/lib/hub/live";
+import { refreshHubWatch } from "@/lib/hub/watch";
+import { loadHubSession, openVault } from "@/lib/hub/session-vault";
 import { isDemo } from "@/lib/env";
 import { ghFetch } from "@/lib/github/gh";
 import { profileRunner } from "@/lib/local/profile-runner";
@@ -8,13 +12,20 @@ import { GitHubRest } from "@/lib/github/rest";
 import { SyncEngine } from "@/lib/sync/engine";
 import { CoordinationStore } from "@/lib/sync/store";
 import { TeamService } from "@/lib/team/service";
+import { HubTeamService } from "@/lib/team/hub-service";
+import { httpHubAdmin, hubSessionPort, keyFileFor, registerHubLinkState } from "@/lib/hub/ports-impl";
+import { hubBackendId } from "@/lib/local/backends";
+import { mergeportHome } from "@/lib/local/profile";
+import { readHubs } from "@/lib/local/registry";
+import { env } from "@/lib/env";
 
 /**
- * Per-process singletons for the local app: the sync engine, the team service and the event bus the browser listens to.
- * They exist only for a signed-in (non-demo) profile; demo mode never contacts GitHub.
+ * Per-process singletons for the local app: the sync engine, the team service, the hub live link and the event bus the
+ * browser listens to. They exist only for a signed-in (non-demo) profile; demo mode never contacts GitHub or a hub.
  */
 
-type G = typeof globalThis & { __mp?: { bus: EventEmitter; engine?: SyncEngine; team?: TeamService; version: number } };
+type HubLive = ReturnType<typeof startHubLive>;
+type G = typeof globalThis & { __mp?: { bus: EventEmitter; engine?: SyncEngine; enginePromise?: Promise<SyncEngine | null>; team?: TeamService; hub?: { key: string; svc: HubTeamService }; live?: HubLive; version: number } };
 const g = globalThis as G;
 const state = (g.__mp ??= { bus: new EventEmitter(), version: 0 });
 state.bus.setMaxListeners(50);
@@ -48,22 +59,66 @@ export async function localActor() {
   return user ? { id: user.githubId, login: user.login } : null;
 }
 
+/** The hub session token of this profile, decrypted per call so a sign-out or a new sign-in is picked up at once. */
+const hubToken = async (): Promise<string | null> => (await loadHubSession(db, openVault(keyFileFor(resolveDbFile()))))?.token ?? null;
+
+/**
+ * Builds the engine for this profile's backend. A GitHub profile gets the GitHub store exactly as before. A hub profile
+ * (`TeamConfig.backend = HUB` with an origin) gets an `HttpHubClient` and the live link, started once per process;
+ * `hubLive` lets the engine's own tick leave hub spaces to the socket while it is up.
+ */
 export async function getEngine(): Promise<SyncEngine | null> {
   if (isDemo()) return null;
   if (state.engine) return state.engine;
+  // Concurrent first callers (the scheduler's first tick and a page render) share one build. Two engines would each keep their own
+  // "cycle in progress" set, and the live link would drive a different engine than the pages and the Sync button use.
+  const building = (state.enginePromise ??= buildEngine().then(
+    (e) => {
+      if (!e) state.enginePromise = undefined; // no signed-in account yet: ask again next time
+      return e;
+    },
+    (err) => {
+      state.enginePromise = undefined;
+      throw err;
+    },
+  ));
+  return building;
+}
+
+async function buildEngine(): Promise<SyncEngine | null> {
   const actor = await localActor();
   if (!actor) return null;
   const f = ghFetch(profileRunner(db));
-  state.engine = new SyncEngine({
+  const onChange = (e: { spaceId: string; reason: "pulled" | "pushed" | "state" }) => {
+    state.version++;
+    state.bus.emit("change", { version: state.version, ...e });
+  };
+  const team = await db.teamConfig.findUnique({ where: { id: "team" } });
+  const hubOrigin = team?.backend === "HUB" ? team.hubOrigin : null;
+  if (!hubOrigin) {
+    state.engine = new SyncEngine({
+      db,
+      actor,
+      store: (s: Space) => new CoordinationStore(new GitHubRest(f), s.repoOwner, s.repoName),
+      onChange,
+    });
+    return state.engine;
+  }
+  const client = new HttpHubClient(hubOrigin, hubToken);
+  const engine = new SyncEngine({
     db,
     actor,
     store: (s: Space) => new CoordinationStore(new GitHubRest(f), s.repoOwner, s.repoName),
-    onChange: (e) => {
-      state.version++;
-      state.bus.emit("change", { version: state.version, ...e });
-    },
+    hub: () => client,
+    hubLive: () => state.live?.live() ?? false,
+    onChange,
   });
-  return state.engine;
+  state.engine = engine;
+  if (!state.live) {
+    state.live = startHubLive({ db, engine, client, origin: hubOrigin, getToken: hubToken, notify: () => notifyChange("pulled"), kickJobs: () => void import("@/lib/local/scheduler").then((m) => m.runJobsNow()).catch(() => {}) });
+    registerHubLinkState(() => state.live?.link.state ?? "offline");
+  }
+  return engine;
 }
 
 export async function getTeamService(): Promise<TeamService | null> {
@@ -75,9 +130,43 @@ export async function getTeamService(): Promise<TeamService | null> {
   return state.team;
 }
 
+/**
+ * Team administration for a hub profile. The hub origin is the one on TeamConfig, else the known-servers list entry for the
+ * active backend; the session token is read per call, so signing out or in again is picked up at once. One instance per
+ * session account, because the service caches what the hub last said about the actor.
+ */
+export async function getHubTeamService(backend: string): Promise<{ svc: HubTeamService; dbFile: string; origin: string | null }> {
+  const dbFile = resolveDbFile();
+  const team = await db.teamConfig.findUnique({ where: { id: "team" } });
+  const entry = readHubs(mergeportHome(env().MERGEPORT_HOME)).find((h) => {
+    try {
+      return hubBackendId(h.origin) === backend;
+    } catch {
+      return false;
+    }
+  });
+  const origin = (team?.backend === "HUB" && team.hubOrigin) || entry?.origin || null;
+  const session = await hubSessionPort.read(dbFile);
+  const key = `${backend}:${session?.githubId ?? ""}`;
+  if (state.hub?.key !== key) {
+    // With no known origin or session every call fails as "sign in again" (HubUnauthorized) before any request is made.
+    state.hub = { key, svc: new HubTeamService(httpHubAdmin(origin ?? "http://127.0.0.1:0", async () => (origin ? ((await hubSessionPort.read(dbFile))?.token ?? null) : null)), session?.githubId ?? "") };
+  }
+  return { svc: state.hub.svc, dbFile, origin };
+}
+
+/**
+ * Tells the hub which repositories this profile tracks (ACTIVE ones), after tracking, untracking or a status change. A no-op in GitHub-only mode. */
+export { refreshHubWatch };
+
 export const resetRuntime = () => {
+  state.live?.stop();
+  state.live = undefined;
+  registerHubLinkState(null);
   state.engine = undefined;
+  state.enginePromise = undefined;
   state.team = undefined;
+  state.hub = undefined;
 };
 
 /**

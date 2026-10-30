@@ -5,6 +5,7 @@ import { loginCommand, REQUIRED_SCOPES } from "@/lib/github/gh";
 import { Banner } from "@/components/ui/primitives";
 import { ShieldCheck } from "@/components/ui/icons";
 import { GhLogin } from "@/components/forms/GhLogin";
+import { HubConnect } from "@/components/forms/HubConnect";
 
 export const metadata = { title: "Sign in" };
 export const dynamic = "force-dynamic";
@@ -15,6 +16,9 @@ const ERRORS: Record<string, string> = {
   "gh-error": "gh could not reach GitHub. Check your connection and try again.",
   mismatch: "gh is signed in as a different account than this profile belongs to. Switch with gh auth switch, or start Mergeport again to use that account's own profile.",
   "demo-unseeded": "Demo data has not been seeded. Run npm run local:demo.",
+  "hub-not-invited": "That GitHub account is not invited to this server. Ask its owner to invite you.",
+  "hub-removed": "You were removed from that server. Ask its owner to invite you again.",
+  "hub-expired": "The sign-in code expired. Connect again.",
 };
 
 export default async function SignIn({ searchParams }: { searchParams: Promise<{ error?: string }> }) {
@@ -71,6 +75,13 @@ export default async function SignIn({ searchParams }: { searchParams: Promise<{
           )}
         </div>
       </div>
+
+      {!demo && (
+        <div className="panel">
+          <div className="panel-head"><h2 className="text-[13px] font-medium text-ink-2">Connect to a server</h2></div>
+          <div className="panel-body p-4"><HubConnect /></div>
+        </div>
+      )}
 
       {demo && (
         <div className="panel">

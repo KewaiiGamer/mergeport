@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { Prisma, Space } from "@/generated/prisma/client";
 import type { Db } from "@/lib/db";
 import { GithubError } from "@/lib/github/port";
+import { HubError, type Backend, type EntityEvent, type HubClient } from "@/lib/hub/types";
 import { mapLimit } from "@/lib/util";
 import { ENTITY_SCHEMA, ENTITY_TYPES, entityDef, entityPath, parseEntityPath, type Ctx, type EntityDef, type Listed } from "./entities";
 import { same, threeWayMerge, type Data } from "./merge";
@@ -38,6 +39,10 @@ export function parseManifest(text: string): Manifest | { error: string } {
   return m as Manifest;
 }
 
+/** One local copy a hub restore replaced. */
+export type RestoreEntry = { type: string; entityId: string; deleted: boolean; data: Data; resend: boolean; /** The hub's version of the entity when the restore was detected (0: absent). */ hubVersion: number };
+const RESTORE_DETAIL_CAP = 100;
+
 export type EntityFile = { schema: number; type: string; id: string; version: number; deleted: boolean; appliedOps: string[]; updatedAt: string; updatedBy: { id: string; login: string }; data: Data };
 
 function parseEntity(text: string, expect: { type: string; id: string }): EntityFile | { error: string } {
@@ -59,6 +64,8 @@ export type EngineDeps = {
   random?: () => number;
   newOpId?: () => string;
   onChange?: (e: { spaceId: string; reason: "pulled" | "pushed" | "state" }) => void;
+  hub?: (space: Space) => HubClient;
+  hubLive?: () => boolean;
 };
 
 const PERMISSION_RECHECK_MS = 5 * 60_000;
@@ -82,6 +89,13 @@ export class SyncEngine {
   }
   private emit(spaceId: string, reason: "pulled" | "pushed" | "state") {
     this.d.onChange?.({ spaceId, reason });
+  }
+  private backendOf(space: Space): Backend {
+    if (space.backend === "HUB") {
+      if (!this.d.hub) throw new Error("No hub client configured");
+      return { kind: "hub", client: this.d.hub(space) };
+    }
+    return { kind: "github", store: this.d.store(space) };
   }
 
   // ---------- context ----------
@@ -157,6 +171,232 @@ export class SyncEngine {
   // ---------- pull ----------
 
   async pullSpace(space0: Space): Promise<{ changed: boolean; applied: number }> {
+    if (space0.backend === "HUB") return this.pullHub(space0);
+    return this.pullGithub(space0);
+  }
+
+  private async pullHub(space0: Space): Promise<{ changed: boolean; applied: number }> {
+    const backend = this.backendOf(space0);
+    if (backend.kind !== "hub") throw new Error("Not a hub space");
+    const client = backend.client;
+    const space = space0;
+    // A revoked space is reopened by syncHubSpaces (the hub's member list), never by a pull that happens to succeed.
+    if (space.access === "REVOKED") return { changed: false, applied: 0 };
+    const start = space.hubCursor;
+    // The cursor is a position in THIS hub's history. A hub that answers with an older position or with a different op at our position
+    // (restored from a backup, then moved on) is not the history we followed: `restored`, and local state is compared with the hub's before it is replaced.
+    // A hub that no longer holds our position because it pruned it is not a restore: the snapshot only moves forward.
+    let since = start;
+    let cursor = start;
+    let cursorOp = space.hubCursorOp;
+    let restored: false | "certain" | "suspected" = false;
+    let epoch = space.hubEpoch;
+    const events: EntityEvent[] = [];
+    let snapshot: { epoch?: string; seq: bigint; seqOp?: string; entities: EntityFile[] } | null = null;
+    try {
+      for (;;) {
+        const r = await client.pull(space.hubSpaceId, since, cursorOp || undefined);
+        if (await this.revokedMeanwhile(space.id)) return { changed: false, applied: 0 };
+        // A different hub process than the one this cursor came from may be serving a database restored from a backup: its history can look
+        // like a continuation of ours without being one (our own pushes are not in our cursor). Compare with a snapshot instead of trusting events.
+        const newProcess = r !== "gone" && r !== "history" && !!space.hubEpoch && !!r.epoch && r.epoch !== space.hubEpoch;
+        if (r === "gone" || r === "history" || r.seq < since || newProcess) {
+          restored = r === "history" || (r !== "gone" && r.seq < since) ? "certain" : newProcess ? "suspected" : false;
+          snapshot = await client.snapshot(space.hubSpaceId);
+          if (await this.revokedMeanwhile(space.id)) return { changed: false, applied: 0 };
+          cursor = snapshot.seq;
+          cursorOp = snapshot.seqOp ?? "";
+          epoch = snapshot.epoch ?? epoch;
+          break;
+        }
+        epoch = r.epoch ?? epoch;
+        events.push(...r.events);
+        const last = r.events[r.events.length - 1];
+        if (r.more && last) {
+          since = last.seq;
+          cursor = last.seq;
+          cursorOp = last.opId;
+          continue;
+        }
+        cursor = r.seq;
+        cursorOp = r.seqOp ?? last?.opId ?? "";
+        break;
+      }
+    } catch (e) {
+      await this.handleHubError(space, e, "read");
+      return { changed: false, applied: 0 };
+    }
+
+    // Only the newest event per entity matters; the hub's version is the whole state.
+    let items: { file: EntityFile; seq: bigint }[];
+    if (snapshot) {
+      const seq = snapshot.seq;
+      items = snapshot.entities.filter((f) => !!entityDef(f.type)).map((file) => ({ file, seq }));
+    } else {
+      const latest = new Map<string, { file: EntityFile; seq: bigint }>();
+      for (const ev of events) {
+        if (!entityDef(ev.type)) continue; // unknown types are ignored (and never rewritten)
+        const prev = latest.get(`${ev.type}/${ev.id}`);
+        if (!prev || ev.seq > prev.seq) latest.set(`${ev.type}/${ev.id}`, { file: ev, seq: ev.seq });
+      }
+      items = [...latest.values()];
+    }
+    let vanished: { type: string; entityId: string; baseVersion: number }[] = [];
+    if (snapshot) {
+      const present = new Set(snapshot.entities.map((f) => `${f.type}/${f.id}`));
+      vanished = (await this.db.syncEntity.findMany({ where: { spaceId: space.id, deleted: false } })).filter((s) => !!entityDef(s.type) && !present.has(`${s.type}/${s.entityId}`));
+    }
+
+    const ctx = await this.ctx(space);
+    const replaced = restored && snapshot ? await this.collectRestoreLoss(ctx, snapshot.entities, restored === "certain") : null;
+    const { applied, skipped, failedSeq } = await this.applyHubEntities(ctx, items, vanished);
+    if (failedSeq !== null) {
+      // The cursor stays before the first entity that could not be applied, so the next pull retries it.
+      if (snapshot) {
+        cursor = start;
+        cursorOp = space.hubCursorOp;
+      } else if (failedSeq - 1n < cursor) {
+        cursor = failedSeq - 1n < start ? start : failedSeq - 1n;
+        // The op at a cursor this far back is not known here; the hub skips the position check when it is not given one.
+        cursorOp = cursor === start ? space.hubCursorOp : "";
+      }
+    } else if (replaced && (replaced.rolledBack > 0 || (restored === "certain" && replaced.kept > 0))) {
+      // Unsent edits alone are not a loss; after a mere restart (suspected) they are not worth a notice.
+      await this.db.hubRestore.create({ data: { spaceId: space.id, rolledBack: replaced.rolledBack, kept: replaced.kept, detail: replaced.detail as Prisma.InputJsonValue } });
+      this.emit(space.id, "state");
+    }
+
+    const now = this.now();
+    const moved = cursor !== start;
+    await this.db.space.update({
+      where: { id: space.id },
+      data: {
+        hubCursor: cursor, hubCursorOp: cursorOp, hubEpoch: failedSeq !== null && snapshot ? space.hubEpoch : epoch, lastPolledAt: now, ...(applied || moved ? { lastChangedAt: now, unchangedPolls: 0 } : {}),
+        rateLimitedUntil: null,
+        lastError: skipped.length ? `Skipped ${skipped.length} unreadable entity(ies): ${skipped[0]}` : null,
+      },
+    });
+    await this.schedule({ ...space, unchangedPolls: applied || moved ? 0 : space.unchangedPolls }, applied || moved ? "changed" : "unchanged");
+    if (applied) this.emit(space.id, "pulled");
+    return { changed: applied > 0 || moved, applied };
+  }
+
+  /**
+   * The hub's history is not the one this computer followed. Before the hub's state replaces local state, record which clean local copies are about to
+   * be replaced (`kept` counts entities with unsent edits: reconcile merges those against the restored state and never drops them).
+   * `resend` marks a copy that is provably newer than what the hub now holds (higher version, or gone from the hub): those can be sent back on request.
+   */
+  private async collectRestoreLoss(ctx: Ctx, entities: EntityFile[], certain: boolean): Promise<{ rolledBack: number; kept: number; detail: RestoreEntry[] }> {
+    const space = ctx.space;
+    const hub = new Map(entities.map((f) => [`${f.type}/${f.id}`, f]));
+    let rolledBack = 0;
+    const detail: RestoreEntry[] = [];
+    const unsent = new Set((await this.db.outboxOp.findMany({ where: { spaceId: space.id, status: { in: ["PENDING", "SENT", "CONFLICT"] } }, select: { entityType: true, entityId: true } })).map((o) => `${o.entityType}/${o.entityId}`));
+    for (const def of ENTITY_TYPES) {
+      const local = await this.localMap(def, ctx.commonSpaceId);
+      for (const se of await this.db.syncEntity.findMany({ where: { spaceId: space.id, type: def.type } })) {
+        const row = local.get(se.entityId);
+        if (row?.spaceId && row.spaceId !== space.id) continue;
+        if (unsent.has(`${def.type}/${se.entityId}`)) continue;
+        const h = hub.get(`${def.type}/${se.entityId}`);
+        const base = (se.baseData as Data | null) ?? {};
+        const differs = h ? h.deleted !== se.deleted || (!h.deleted && !same(h.data, base)) : !se.deleted;
+        if (!differs) continue;
+        // Only when the hub's history is known to differ from ours is a hub entity that is ahead of our copy a loss; a restarted hub whose
+        // history may simply be a continuation is expected to be ahead, and that is an ordinary remote edit.
+        const resend = h ? h.version <= se.baseVersion : true;
+        if (!certain && !resend) continue;
+        rolledBack++;
+        if (detail.length >= RESTORE_DETAIL_CAP) continue;
+        detail.push({ type: def.type, entityId: se.entityId, deleted: se.deleted || !row, data: row?.data ?? base, resend, hubVersion: h?.version ?? 0 });
+      }
+    }
+    return { rolledBack, kept: unsent.size, detail };
+  }
+
+  /** Puts the local copies a restore replaced back as ordinary unsent edits, against the hub's current versions. */
+  async resendRestored(restoreId: string): Promise<{ queued: number }> {
+    const rec = await this.db.hubRestore.findUniqueOrThrow({ where: { id: restoreId } });
+    if (rec.status !== "OPEN") return { queued: 0 };
+    const space = await this.db.space.findUniqueOrThrow({ where: { id: rec.spaceId } });
+    const ctx = await this.ctx(space);
+    let queued = 0;
+    for (const e of rec.detail as unknown as RestoreEntry[]) {
+      const def = entityDef(e.type);
+      if (!def || !e.resend) continue;
+      const key = { spaceId_type_entityId: { spaceId: space.id, type: e.type, entityId: e.entityId } };
+      const se = await this.db.syncEntity.findUnique({ where: key });
+      // Anything done to this entity since the restore wins over the old copy.
+      if (await this.db.outboxOp.count({ where: { spaceId: space.id, entityType: e.type, entityId: e.entityId, status: { in: ["PENDING", "SENT", "CONFLICT", "QUARANTINED"] } } })) continue;
+      const local = (await this.localMap(def, ctx.commonSpaceId)).get(e.entityId);
+      const base = (se?.baseData as Data | null) ?? {};
+      if (local && !same(local.data, base)) continue;
+      // Against the hub's version when the restore was seen: if it has moved since, the push answers stale and the ordinary merge decides.
+      if (!e.deleted) await def.apply(this.db, ctx, e.entityId, e.data, e.hubVersion);
+      await this.db.outboxOp.create({ data: { id: this.opId(), spaceId: space.id, entityType: e.type, entityId: e.entityId, kind: e.deleted ? "DELETE" : "UPSERT", ...(e.deleted ? {} : { data: e.data as Prisma.InputJsonValue }), baseVersion: e.hubVersion } });
+      queued++;
+    }
+    await this.db.hubRestore.update({ where: { id: restoreId }, data: { status: "RESENT" } });
+    this.emit(space.id, "state");
+    return { queued };
+  }
+
+  async dismissRestored(restoreId: string): Promise<void> {
+    await this.db.hubRestore.updateMany({ where: { id: restoreId, status: "OPEN" }, data: { status: "DISMISSED" } });
+  }
+
+  /** The per-entity apply loop for hub events and snapshots: same guards as a GitHub pull, in ENTITY_TYPES order. */
+  private async applyHubEntities(ctx: Ctx, items: { file: EntityFile; seq: bigint }[], vanished: { type: string; entityId: string; baseVersion: number }[]) {
+    const space = ctx.space;
+    let applied = 0;
+    const skipped: string[] = [];
+    let failedSeq: bigint | null = null;
+    const fail = (seq: bigint, msg: string) => {
+      skipped.push(msg);
+      if (failedSeq === null || seq < failedSeq) failedSeq = seq;
+    };
+    for (const def of ENTITY_TYPES) {
+      const local = await this.localMap(def, ctx.commonSpaceId);
+      const appliedHere: { id: string; data: Data }[] = [];
+      for (const { file, seq } of items.filter((i) => i.file.type === def.type)) {
+        const name = `${file.type}/${file.id}`;
+        if (file.schema > ENTITY_SCHEMA) {
+          skipped.push(`${name}: needs a newer Mergeport`);
+          await this.blockEntity(space.id, def.type, file.id, String(seq), file.version);
+          continue;
+        }
+        // An entity this person has placed in ANOTHER space is not overwritten, moved or deleted from here.
+        const row = local.get(file.id);
+        if (row?.spaceId && row.spaceId !== space.id) continue;
+        try {
+          const r = await this.reconcile(ctx, def, file, String(seq), row?.data ?? null);
+          if (r.applied) {
+            applied++;
+            if (r.data) appliedHere.push({ id: file.id, data: r.data });
+          } else {
+            // Not recorded: a prerequisite entity is not there yet. Hold the cursor so it is retried.
+            const se = await this.db.syncEntity.findUnique({ where: { spaceId_type_entityId: { spaceId: space.id, type: def.type, entityId: file.id } } });
+            if (!se || se.baseVersion !== file.version) fail(seq, `${name}: waiting for a related entity`);
+          }
+        } catch (e) {
+          fail(seq, `${name}: ${e instanceof Error ? e.message : "could not be applied"}`);
+        }
+      }
+      for (const v of vanished.filter((s) => s.type === def.type)) {
+        const owner = local.get(v.entityId);
+        if (owner?.spaceId && owner.spaceId !== space.id) continue;
+        const hasLocalEdits = (await this.db.outboxOp.count({ where: { spaceId: space.id, entityType: def.type, entityId: v.entityId, status: { in: ["PENDING", "SENT", "CONFLICT"] } } })) > 0;
+        if (hasLocalEdits) continue;
+        await def.apply(this.db, ctx, v.entityId, null, v.baseVersion);
+        await this.db.syncEntity.update({ where: { spaceId_type_entityId: { spaceId: space.id, type: def.type, entityId: v.entityId } }, data: { deleted: true, remoteSha: null } });
+        applied++;
+      }
+      if (def.post && appliedHere.length) await def.post(this.db, ctx, appliedHere);
+    }
+    return { applied, skipped, failedSeq: failedSeq as bigint | null };
+  }
+
+  private async pullGithub(space0: Space): Promise<{ changed: boolean; applied: number }> {
     let space = space0;
     const store = this.d.store(space);
     const now = this.now();
@@ -388,6 +628,106 @@ export class SyncEngine {
   // ---------- push ----------
 
   async pushSpace(space0: Space): Promise<{ sent: number }> {
+    if (space0.backend === "HUB") return this.pushHub(space0);
+    return this.pushGithub(space0);
+  }
+
+  private async pushHub(space0: Space): Promise<{ sent: number }> {
+    let space = await this.db.space.findUniqueOrThrow({ where: { id: space0.id } });
+    const backend = this.backendOf(space); // throws when no hub client is configured, even for a read-only space
+    if (backend.kind !== "hub") throw new Error("Not a hub space");
+    const client = backend.client;
+    if (!space.canWrite || space.access !== "OK") return { sent: 0 };
+    const ctx = await this.ctx(space);
+    const keyOf = (type: string, entityId: string) => ({ spaceId_type_entityId: { spaceId: space.id, type, entityId } });
+    let sent = 0;
+    let touched = false;
+    // A stale answer is merged and the rewritten operation is retried at once; the round cap keeps a hot entity from spinning.
+    for (let round = 0; round < 3; round++) {
+      const ops0 = await this.db.outboxOp.findMany({ where: { spaceId: space.id, status: "PENDING" }, orderBy: { createdAt: "asc" } });
+      const ops: typeof ops0 = [];
+      for (const op of ops0) {
+        const se = await this.db.syncEntity.findUnique({ where: keyOf(op.entityType, op.entityId) });
+        if (!isBlocked(se)) ops.push(op);
+      }
+      if (ops.length === 0) break;
+      await this.db.outboxOp.updateMany({ where: { id: { in: ops.map((o) => o.id) } }, data: { status: "SENT", attempts: { increment: 1 } } });
+      let results: Awaited<ReturnType<HubClient["push"]>>;
+      try {
+        results = await client.push(space.hubSpaceId, ops.map((o) => ({ opId: o.id, type: o.entityType, entityId: o.entityId, kind: o.kind as "UPSERT" | "DELETE", baseVersion: o.baseVersion, data: o.kind === "DELETE" ? undefined : ((o.data as Data) ?? {}) })));
+      } catch (e) {
+        // Whether the hub applied them is unknown for network errors: the operation id makes the retry idempotent.
+        await this.db.outboxOp.updateMany({ where: { id: { in: ops.map((o) => o.id) }, status: "SENT" }, data: { status: "PENDING", error: e instanceof Error ? e.message : String(e) } });
+        await this.handleHubError(space, e, "write");
+        return { sent };
+      }
+      // Access removed while the request was in flight: revokeSpace already quarantined these operations and dropped the
+      // space's rows; recording the hub's answers now would re-create them on a space this person can no longer see.
+      if (await this.revokedMeanwhile(space.id)) return { sent };
+      let rewritten = false;
+      try {
+      const byId = new Map(results.results.map((r) => [r.opId, r]));
+      for (const op of ops) {
+        const r = byId.get(op.id);
+        const se = await this.db.syncEntity.findUnique({ where: keyOf(op.entityType, op.entityId) });
+        const settle = async (version: number) => {
+          const applied = [...(((se?.meta as { applied?: string[] } | null)?.applied ?? []).slice(-49)), op.id];
+          const row = { path: entityPath(op.entityType, op.entityId), remoteSha: null, baseVersion: version, baseData: ((op.kind === "DELETE" ? {} : op.data) ?? {}) as Prisma.InputJsonValue, meta: { applied } as Prisma.InputJsonValue, deleted: op.kind === "DELETE" };
+          await this.db.syncEntity.upsert({ where: keyOf(op.entityType, op.entityId), create: { spaceId: space.id, type: op.entityType, entityId: op.entityId, ...row }, update: row });
+        };
+        if (!r) {
+          await this.db.outboxOp.updateMany({ where: { id: op.id, status: "SENT" }, data: { status: "PENDING" } });
+        } else if (r.status === "applied") {
+          await settle(r.version);
+          await this.db.outboxOp.deleteMany({ where: { id: op.id } });
+          sent++;
+          touched = true;
+        } else if (r.status === "duplicate") {
+          if (r.version === (se?.baseVersion ?? 0) + 1) await settle(r.version);
+          await this.db.outboxOp.deleteMany({ where: { id: op.id } });
+          touched = true;
+        } else {
+          await this.db.outboxOp.updateMany({ where: { id: op.id, status: "SENT" }, data: { status: "PENDING" } });
+          const def = entityDef(op.entityType);
+          const current = r.current;
+          if (!def) continue;
+          if (!current) {
+            await this.db.outboxOp.updateMany({ where: { id: op.id }, data: { baseVersion: r.version } });
+            rewritten = true;
+            continue;
+          }
+          if (current.schema > ENTITY_SCHEMA) {
+            await this.blockEntity(space.id, def.type, current.id, String(results.seq), current.version);
+            continue;
+          }
+          const row = (await this.localMap(def, ctx.commonSpaceId)).get(op.entityId);
+          if (row?.spaceId && row.spaceId !== space.id) continue;
+          try {
+            const m = await this.reconcile(ctx, def, current, String(results.seq), row?.data ?? null);
+            if (m.applied && m.data && def.post) await def.post(this.db, ctx, [{ id: op.entityId, data: m.data }]);
+          } catch (e) {
+            await this.db.outboxOp.updateMany({ where: { id: op.id, status: "PENDING" }, data: { error: e instanceof Error ? e.message : String(e) } });
+            continue;
+          }
+          if (await this.db.outboxOp.count({ where: { id: op.id, status: "PENDING" } })) rewritten = true;
+        }
+      }
+      } catch (e) {
+        // A local failure while recording results must not strand operations in SENT: the hub's duplicate answer makes the retry safe.
+        await this.db.outboxOp.updateMany({ where: { id: { in: ops.map((o) => o.id) }, status: "SENT" }, data: { status: "PENDING", error: e instanceof Error ? e.message : String(e) } });
+        await this.handleHubError(space, e, "write");
+        return { sent };
+      }
+      if (!rewritten) break;
+    }
+    if (touched) {
+      space = await this.db.space.update({ where: { id: space.id }, data: { lastChangedAt: this.now(), lastError: null } });
+      this.emit(space.id, "pushed");
+    }
+    return { sent };
+  }
+
+  private async pushGithub(space0: Space): Promise<{ sent: number }> {
     let space = await this.db.space.findUniqueOrThrow({ where: { id: space0.id } });
     if (!space.canWrite || space.access !== "OK") return { sent: 0 };
     const store = this.d.store(space);
@@ -487,6 +827,7 @@ export class SyncEngine {
     const spaces = await this.db.space.findMany({ where: { OR: [{ nextPollAt: null }, { nextPollAt: { lte: now } }] } });
     let polled = 0;
     for (const s of spaces) {
+      if (s.backend === "HUB" && this.d.hubLive?.()) continue; // the live stream drives hub spaces
       if (s.rateLimitedUntil && s.rateLimitedUntil > now) continue;
       if (s.access === "REVOKED" || s.access === "SCHEMA_NEWER") {
         if (s.lastPolledAt && now.getTime() - s.lastPolledAt.getTime() < REVOKED_RECHECK_MS) continue;
@@ -509,7 +850,7 @@ export class SyncEngine {
 
   private async schedule(space: Space, outcome: "changed" | "unchanged" | "error", retryAfterMs?: number): Promise<void> {
     const team = await this.db.teamConfig.findUnique({ where: { id: "team" } });
-    const base = Math.max(15, team?.pollSeconds ?? 30) * 1000;
+    const base = space.backend === "HUB" ? (this.d.hubLive?.() ? MAX_POLL_MS : 60_000) : Math.max(15, team?.pollSeconds ?? 30) * 1000;
     let interval: number;
     let unchanged = space.unchangedPolls;
     if (outcome === "changed") {
@@ -564,13 +905,48 @@ export class SyncEngine {
     this.emit(space.id, "state");
   }
 
+  /** True when the space lost access (revokeSpace ran) since the caller last read it: a pull or push in flight must stop. */
+  private async revokedMeanwhile(spaceId: string): Promise<boolean> {
+    const s = await this.db.space.findUnique({ where: { id: spaceId }, select: { access: true } });
+    return !s || s.access === "REVOKED";
+  }
+
+  private async handleHubError(space: Space, e: unknown, phase: "read" | "write"): Promise<void> {
+    if (!(e instanceof HubError)) {
+      await this.schedule(space, "error");
+      await this.db.space.update({ where: { id: space.id }, data: { lastError: e instanceof Error ? e.message : String(e) } });
+      return;
+    }
+    const now = this.now();
+    if (e.kind === "network") {
+      await this.schedule(space, "error");
+      await this.db.space.update({ where: { id: space.id }, data: { lastError: "offline" } });
+    } else if (e.kind === "auth") {
+      await this.schedule(space, "error");
+      await this.db.space.update({ where: { id: space.id }, data: { lastError: "Sign in to the server again" } });
+    } else if (e.kind === "not-found" || (e.kind === "forbidden" && phase === "read")) {
+      await this.revokeSpace(space.id, "Access to this space was removed");
+    } else if (e.kind === "forbidden") {
+      // Lost write permission but maybe still readable: fall back to read-only and keep the edits for a person to decide on.
+      await this.db.space.update({ where: { id: space.id }, data: { canWrite: false, lastError: "You no longer have write access to this space." } });
+      await this.db.outboxOp.updateMany({ where: { spaceId: space.id, status: { in: ["PENDING", "SENT"] } }, data: { status: "QUARANTINED", error: "Write access was removed" } });
+    } else if (e.kind === "rate-limited") {
+      const until = new Date(now.getTime() + (e.retryAfterSeconds ?? 60) * 1000);
+      await this.db.space.update({ where: { id: space.id }, data: { rateLimitedUntil: until, lastError: "The server asked to slow down. Edits stay queued locally.", nextPollAt: until } });
+    } else {
+      await this.schedule(space, "error");
+      await this.db.space.update({ where: { id: space.id }, data: { lastError: e.message } });
+    }
+    this.emit(space.id, "state");
+  }
+
   /**
    * Stop reads and writes, quarantine unsent edits (kept, not deleted), and remove cached copies of the space's data
    * from this machine. This cannot erase Git history or anything a person downloaded outside the app.
    */
   async revokeSpace(spaceId: string, why: string): Promise<void> {
     const space = await this.db.space.findUniqueOrThrow({ where: { id: spaceId } });
-    await this.db.space.update({ where: { id: spaceId }, data: { access: "REVOKED", canWrite: false, canAdmin: false, lastError: why, headSha: null, etag: null, nextPollAt: new Date(this.now().getTime() + REVOKED_RECHECK_MS) } });
+    await this.db.space.update({ where: { id: spaceId }, data: { access: "REVOKED", canWrite: false, canAdmin: false, lastError: why, headSha: null, etag: null, hubCursor: 0n, nextPollAt: new Date(this.now().getTime() + REVOKED_RECHECK_MS) } });
     await this.db.outboxOp.updateMany({ where: { spaceId, status: { in: ["PENDING", "SENT", "CONFLICT"] } }, data: { status: "QUARANTINED", error: why } });
     if (space.canAdmin) {
       // An admin created this data on this computer. A repository that was renamed, deleted or hidden must never erase their
@@ -640,6 +1016,7 @@ export class SyncEngine {
 }
 
 /** Expected delay before a teammate's change shows up here, in seconds. This is polling, not real time. */
-export function expectedConsistencyDelaySeconds(pollSeconds: number): { typical: number; worst: number } {
+export function expectedConsistencyDelaySeconds(pollSeconds: number, hub?: { live: boolean }): { typical: number; worst: number; label?: string } {
+  if (hub) return hub.live ? { typical: 1, worst: 1, label: "about 1 s (live)" } : { typical: 30, worst: 60, label: "up to 1 min (reconnecting)" };
   return { typical: Math.round(pollSeconds / 2 + 2), worst: Math.round(Math.min(MAX_POLL_MS / 1000, pollSeconds * 2 ** 3) * 1.2) };
 }
