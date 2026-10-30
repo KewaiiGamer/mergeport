@@ -6,7 +6,7 @@ import { syncHubSpaces } from "./spaces";
 import { handleGithubEvent } from "./gh-events";
 import { RepoRefresher } from "./repo-refresher";
 import { registerHubWatch, trackedGithubIds } from "./watch";
-import { requestRepositoryRefresh } from "@/lib/services/refresh";
+import { refreshRepositoryAndWait } from "@/lib/services/refresh";
 
 const FALLBACK_POLL_MS = 60_000;
 /** engine.syncSpace silently returns when a cycle is already running; a notified seq not reached is retried this often, a few times. */
@@ -24,8 +24,10 @@ export type HubLiveOptions = {
   random?: () => number;
   /** Called after GitHub events changed local data (the runtime emits `notifyChange("pulled")`). */
   notify?: () => void;
-  /** The fallback refresh of one repository (default: the Repositories page's Refresh, queued as a job). */
+  /** The fallback refresh of one repository; resolves when it really finished (default: the Refresh button's job, awaited until DONE or FAILED). */
   refreshRepository?: (repositoryId: string) => Promise<void>;
+  /** Asks the job worker to run due jobs now (the runtime passes the scheduler's `runJobsNow`). */
+  kickJobs?: () => void;
   /** Clock for the fallback refresher (tests). */
   now?: () => number;
 };
@@ -128,8 +130,7 @@ export function startHubLive(o: HubLiveOptions): { link: HubLink; live(): boolea
   };
   const notify = () => o.notify?.();
   const refresher = new RepoRefresher({
-    run: (id) => (o.refreshRepository ? o.refreshRepository(id) : requestRepositoryRefresh(o.db, id).then(() => undefined)),
-    onDone: notify,
+    run: (id) => (o.refreshRepository ? o.refreshRepository(id) : refreshRepositoryAndWait(o.db, id, { kick: o.kickJobs }).then(() => undefined)),
     timers: o.timers,
     now: o.now,
   });
@@ -145,7 +146,7 @@ export function startHubLive(o: HubLiveOptions): { link: HubLink; live(): boolea
       void sendWatch().catch(() => {});
       void refreshAndSyncAll().catch(() => {});
     },
-    onGithubEvent: (e) => void handleGithubEvent(o.db, e, { refresh: (id) => refresher.request(id), notify }).catch(() => {}),
+    onGithubEvent: (e) => void handleGithubEvent(o.db, e, { refresh: (id, kind) => refresher.request(id, kind), notify }).catch(() => {}),
     onChanged: (hubSpaceId, seq) => {
       void (async () => {
         let sp = await byHubId(hubSpaceId);

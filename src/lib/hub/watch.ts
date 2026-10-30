@@ -17,7 +17,11 @@ export function registerHubWatch(fn: (() => void) | null) {
   g.__mpHubWatch = fn;
 }
 
-/** Re-sends the watched set to the hub after tracking, untracking or a status change. A no-op without a hub link; never throws. */
+/**
+ * Re-sends the watched set to the hub after tracking, untracking or a status change. A no-op without a hub link; never throws.
+ * Same process: the job worker is the scheduler `src/instrumentation.ts` starts (`startLocalScheduler`), which runs in the Node
+ * process that also holds the live link and the services calling this, so one in-process registry is enough.
+ */
 export function refreshHubWatch(): void {
   try {
     g.__mpHubWatch?.();

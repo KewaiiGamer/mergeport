@@ -56,7 +56,7 @@ export class HubLink {
   private failures = 0;
   private retry: unknown = null;
   private ping: unknown = null;
-  private opened = false;
+  private helloed = false;
   private debounce = new Map<string, { seq: bigint; timer: unknown }>();
   private readonly timers: Timers;
   private readonly random: () => number;
@@ -85,15 +85,15 @@ export class HubLink {
     this._state = "offline";
   }
 
-  /** True while a socket is open: `watch` sends only then. After every `hello` the owner sends its set again. */
+  /** True once the current socket has received `hello` (cleared on close): `watch` sends only then. After every `hello` the owner sends its set again. */
   get isOpen(): boolean {
-    return this.sock !== null && this.opened;
+    return this.sock !== null && this.helloed;
   }
 
   /** Replaces the set of GitHub repositories (decimal ids) this connection wants relays for. Nothing is sent while the socket is closed. */
   watch(repoIds: string[]): void {
     const s = this.sock;
-    if (!s || !this.opened) return;
+    if (!s || !this.helloed) return;
     try {
       s.send(JSON.stringify({ t: "watch", repos: repoIds }));
     } catch {
@@ -134,10 +134,9 @@ export class HubLink {
       return;
     }
     this.sock = s;
-    this.opened = false;
+    this.helloed = false;
     s.onopen = () => {
       if (this.sock !== s) return;
-      this.opened = true;
       this.ping = this.timers.setInterval(() => {
         try {
           s.send(JSON.stringify({ t: "ping" }));
@@ -153,7 +152,7 @@ export class HubLink {
     s.onclose = (e) => {
       if (this.sock !== s) return;
       this.sock = null;
-      this.opened = false;
+      this.helloed = false;
       this.closed(e.code);
     };
   }
@@ -175,6 +174,7 @@ export class HubLink {
   private dispatch(m: { t?: string; [k: string]: unknown }) {
     switch (m.t) {
       case "hello": {
+        this.helloed = true;
         this.failures = 0;
         this.setState("live");
         const spaces = Array.isArray(m.spaces) ? (m.spaces as { id: string; seq: string | number }[]).map((s) => ({ id: String(s.id), seq: BigInt(s.seq) })) : [];
@@ -247,7 +247,7 @@ export class HubLink {
   private dropSocket() {
     const s = this.sock;
     this.sock = null;
-    this.opened = false;
+    this.helloed = false;
     this.clearPing();
     if (!s) return;
     s.onopen = s.onmessage = s.onclose = s.onerror = null;

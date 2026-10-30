@@ -13,6 +13,9 @@ import { refreshHubWatch } from "@/lib/hub/watch";
  * Nothing here is served to browsers directly: all reads go back through viewer-scoped queries.
  */
 
+/** A database or an open transaction: the webhook path applies one event atomically. */
+export type Tx = Db | Prisma.TransactionClient;
+
 export type SyncResult = { items: number; applied: number; skippedStale: number; pages: number; discussionSkipped?: number };
 
 const SKEW_MS = 2 * 60_000;
@@ -57,7 +60,7 @@ function itemData(i: RemoteWorkItem): Prisma.WorkItemUncheckedUpdateInput {
  * `opts.partial` (webhook payloads) keeps the stored mergeable state, checks state and size counters when the incoming
  * pull request has no value for them, instead of resetting them the way a full sync (which always has them) would.
  */
-export async function applyWorkItem(db: Db, repositoryId: string, i: RemoteWorkItem, pr?: Partial<RemoteWorkItem> & { checks?: "NONE" | "PENDING" | "SUCCESS" | "FAILURE" | "UNKNOWN" }, opts: { partial?: boolean } = {}): Promise<boolean> {
+export async function applyWorkItem(db: Tx, repositoryId: string, i: RemoteWorkItem, pr?: Partial<RemoteWorkItem> & { checks?: "NONE" | "PENDING" | "SUCCESS" | "FAILURE" | "UNKNOWN" }, opts: { partial?: boolean } = {}): Promise<boolean> {
   const existing = await db.workItem.findUnique({ where: { repositoryId_number: { repositoryId, number: i.number } }, select: { id: true, updatedAtGh: true } });
   if (!shouldApplyUpdate(existing, i.updatedAt)) return false;
   let prFields: Prisma.WorkItemUncheckedUpdateInput = pr
@@ -71,16 +74,31 @@ export async function applyWorkItem(db: Db, repositoryId: string, i: RemoteWorkI
     if (pr.changedFiles != null) prFields.changedFiles = pr.changedFiles;
     if (pr.checks !== undefined) prFields.checksState = pr.checks;
   }
+  const create = { ...(itemData(i) as object), ...(prFields as object), repositoryId, githubId: i.githubId, number: i.number, type: i.type } as Prisma.WorkItemUncheckedCreateInput;
+  if (opts.partial) {
+    // Webhook path: the age check and the write are ONE statement, so a newer row is never overwritten even when two writers
+    // interleave between the read above and this write.
+    const r = await db.workItem.updateMany({ where: { repositoryId, number: i.number, updatedAtGh: { lte: i.updatedAt } }, data: { ...itemData(i), ...prFields } });
+    if (r.count === 1) return true;
+    if (existing) return false; // the row exists and is newer
+    try {
+      await db.workItem.create({ data: create });
+      return true;
+    } catch {
+      // created by another writer in between: only an equal or older row may still be updated
+      return (await db.workItem.updateMany({ where: { repositoryId, number: i.number, updatedAtGh: { lte: i.updatedAt } }, data: { ...itemData(i), ...prFields } })).count === 1;
+    }
+  }
   await db.workItem.upsert({
     where: { repositoryId_number: { repositoryId, number: i.number } },
-    create: { ...(itemData(i) as object), ...(prFields as object), repositoryId, githubId: i.githubId, number: i.number, type: i.type } as Prisma.WorkItemUncheckedCreateInput,
+    create,
     update: { ...itemData(i), ...prFields },
   });
   return true;
 }
 
 /** Upsert one issue comment or inline review comment by its GitHub id: the write the full sync and the webhook path share. */
-export function upsertComment(db: Db, workItemId: string, kind: "ISSUE_COMMENT" | "REVIEW_COMMENT", c: RemoteComment) {
+export function upsertComment(db: Tx, workItemId: string, kind: "ISSUE_COMMENT" | "REVIEW_COMMENT", c: RemoteComment) {
   return db.workItemComment.upsert({
     where: { workItemId_kind_githubId: { workItemId, kind, githubId: c.githubId } },
     create:

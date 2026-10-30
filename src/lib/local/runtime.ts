@@ -115,7 +115,7 @@ async function buildEngine(): Promise<SyncEngine | null> {
   });
   state.engine = engine;
   if (!state.live) {
-    state.live = startHubLive({ db, engine, client, origin: hubOrigin, getToken: hubToken, notify: () => notifyChange("pulled") });
+    state.live = startHubLive({ db, engine, client, origin: hubOrigin, getToken: hubToken, notify: () => notifyChange("pulled"), kickJobs: () => void import("@/lib/local/scheduler").then((m) => m.runJobsNow()).catch(() => {}) });
     registerHubLinkState(() => state.live?.link.state ?? "offline");
   }
   return engine;
@@ -155,7 +155,8 @@ export async function getHubTeamService(backend: string): Promise<{ svc: HubTeam
   return { svc: state.hub.svc, dbFile, origin };
 }
 
-/** Tells the hub which repositories this profile tracks (ACTIVE ones), after tracking, untracking or a status change. A no-op in GitHub-only mode. */
+/**
+ * Tells the hub which repositories this profile tracks (ACTIVE ones), after tracking, untracking or a status change. A no-op in GitHub-only mode. */
 export { refreshHubWatch };
 
 export const resetRuntime = () => {
