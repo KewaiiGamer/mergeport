@@ -12,6 +12,8 @@ export type Me = {
   team: { id: string; name: string };
   members: unknown[];
   spaces: { id: string; kind: "COMMON" | "RESTRICTED"; name: string; canWrite: boolean; seq: string }[];
+  /** Instant GitHub updates through the hub: whether the hub has a webhook secret, and what it last saw (event name only). */
+  webhooks: { enabled: boolean; appSlug: string | null; lastDeliveryAt: string | null; lastEvent: string | null };
 };
 
 export interface HubClient {

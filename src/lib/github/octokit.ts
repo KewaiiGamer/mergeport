@@ -206,6 +206,11 @@ export class OctokitPort implements GithubPort {
 
   async getPull(owner: string, repo: string, number: number) {
     const { data } = await this.get<any>("GET /repos/{owner}/{repo}/pulls/{pull_number}", { owner, repo, pull_number: number });
+    return OctokitPort.toPull(data);
+  }
+
+  /** A REST pull request object (also the `pull_request` object of a webhook payload, which has the same shape) as a work item with the PR fields. */
+  static toPull(data: any) {
     const base = OctokitPort.toWorkItem({ ...data, pull_request: { merged_at: data.merged_at } });
     return {
       ...base,
@@ -220,6 +225,16 @@ export class OctokitPort implements GithubPort {
       deletions: data.deletions ?? null,
       changedFiles: data.changed_files ?? null,
     };
+  }
+
+  /** A REST issue comment (or the `comment` object of an `issue_comment` webhook). */
+  static toComment(c: any): RemoteComment {
+    return { githubId: BigInt(c.id), login: c.user?.login ?? null, body: c.body ?? null, createdAt: new Date(c.created_at), updatedAt: new Date(c.updated_at) };
+  }
+
+  /** A REST pull request review comment (or the `comment` object of a `pull_request_review_comment` webhook). */
+  static toReviewComment(c: any): RemoteComment {
+    return { ...OctokitPort.toComment(c), path: c.path ?? null, line: c.line ?? c.original_line ?? null, commitSha: c.commit_id ?? null, threadKey: String(c.in_reply_to_id ?? c.id) };
   }
 
   private async paginate<T>(route: string, params: Record<string, unknown>): Promise<T[]> {
@@ -239,12 +254,12 @@ export class OctokitPort implements GithubPort {
 
   async listIssueComments(owner: string, repo: string, number: number): Promise<RemoteComment[]> {
     const rows = await this.paginate<any>("GET /repos/{owner}/{repo}/issues/{issue_number}/comments", { owner, repo, issue_number: number });
-    return rows.map((c) => ({ githubId: BigInt(c.id), login: c.user?.login ?? null, body: c.body ?? null, createdAt: new Date(c.created_at), updatedAt: new Date(c.updated_at) }));
+    return rows.map(OctokitPort.toComment);
   }
 
   async listReviewComments(owner: string, repo: string, number: number): Promise<RemoteComment[]> {
     const rows = await this.paginate<any>("GET /repos/{owner}/{repo}/pulls/{pull_number}/comments", { owner, repo, pull_number: number });
-    return rows.map((c) => ({ githubId: BigInt(c.id), login: c.user?.login ?? null, body: c.body ?? null, createdAt: new Date(c.created_at), updatedAt: new Date(c.updated_at), path: c.path ?? null, line: c.line ?? c.original_line ?? null, commitSha: c.commit_id ?? null, threadKey: String(c.in_reply_to_id ?? c.id) }));
+    return rows.map(OctokitPort.toReviewComment);
   }
 
   async listRequestedReviewers(owner: string, repo: string, number: number): Promise<RemoteRequested> {
