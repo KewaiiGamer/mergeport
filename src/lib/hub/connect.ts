@@ -16,20 +16,22 @@ export type DevicePoll =
   | { status: "expired" };
 
 const TIMEOUT_MS = 8000;
+/** The final poll waits on GitHub twice (token, then profile); one slow answer there must not cost the person their sign-in. */
+const POLL_TIMEOUT_MS = 30_000;
 
 export class HubAuth {
   constructor(private readonly fetchImpl: typeof fetch = fetch) {}
 
-  private async send(url: string, init: RequestInit = {}): Promise<Response> {
+  private async send(url: string, init: RequestInit = {}, timeoutMs = TIMEOUT_MS): Promise<Response> {
     try {
-      return await this.fetchImpl(url, { ...init, signal: AbortSignal.timeout(TIMEOUT_MS), redirect: "error" });
+      return await this.fetchImpl(url, { ...init, signal: AbortSignal.timeout(timeoutMs), redirect: "error" });
     } catch {
       throw new ValidationError("Could not reach that server. Check the address and your connection.");
     }
   }
 
-  private post(origin: string, p: string, body: unknown) {
-    return this.send(`${origin}${p}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  private post(origin: string, p: string, body: unknown, timeoutMs?: number) {
+    return this.send(`${origin}${p}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }, timeoutMs);
   }
 
   async health(typed: string, expectHost: string): Promise<{ origin: string; teamName: string | null; backend: Backend }> {
@@ -66,7 +68,7 @@ export class HubAuth {
   /** `slowDown` on a pending answer: GitHub asked for a longer interval; the caller adds 5 s before polling again. */
   async poll(origin: string, deviceCode: string, pollSecret: string): Promise<DevicePoll> {
     const o = normalizeHubOrigin(origin);
-    const res = await this.post(o, "/auth/device/poll", { deviceCode, pollSecret });
+    const res = await this.post(o, "/auth/device/poll", { deviceCode, pollSecret }, POLL_TIMEOUT_MS);
     if (res.status === 202) {
       const j = (await res.json().catch(() => null)) as { slowDown?: unknown } | null;
       return j?.slowDown === true ? { status: "pending", slowDown: true } : { status: "pending" };

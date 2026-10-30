@@ -2,6 +2,9 @@ import { z } from "zod";
 import type { HubConfig } from "./config";
 import { HttpError } from "./http";
 
+/** A GitHub call that hangs must fail, not hold the sign-in open indefinitely. */
+const GITHUB_TIMEOUT_MS = 20_000;
+
 type OauthCfg = Pick<HubConfig, "githubClientId" | "githubOauthBase" | "githubApiBase">;
 type LookupCfg = Pick<HubConfig, "githubClientId" | "githubClientSecret" | "githubApiBase">;
 
@@ -16,6 +19,7 @@ async function postForm(url: string, body: Record<string, string>): Promise<unkn
       method: "POST",
       headers: { accept: "application/json", "content-type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams(body).toString(),
+      signal: AbortSignal.timeout(GITHUB_TIMEOUT_MS),
     });
   } catch {
     throw new HttpError(502, "github unreachable");
@@ -77,7 +81,7 @@ export async function pollDeviceFlow(cfg: OauthCfg, deviceCode: string): Promise
 export async function fetchGithubUser(cfg: OauthCfg, accessToken: string): Promise<GithubUser> {
   let r: Response;
   try {
-    r = await fetch(`${cfg.githubApiBase}/user`, { headers: { accept: "application/vnd.github+json", authorization: `Bearer ${accessToken}`, "user-agent": "mergeport-hub" } });
+    r = await fetch(`${cfg.githubApiBase}/user`, { headers: { accept: "application/vnd.github+json", authorization: `Bearer ${accessToken}`, "user-agent": "mergeport-hub" }, signal: AbortSignal.timeout(GITHUB_TIMEOUT_MS) });
   } catch {
     throw new HttpError(502, "github unreachable");
   }

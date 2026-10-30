@@ -37,7 +37,9 @@ export function authRoutes(): Route<HubContext>[] {
    * secret, so a device code seen on the wire (a log, a shoulder) is not enough to collect the session. Kept in memory:
    * a restart ends the flows, and the person starts again.
    */
-  const flows = new Map<string, { secretHash: Buffer; expiresAt: number }>();
+  const flows = new Map<string, { secretHash: Buffer; expiresAt: number; final?: { status: number; body: unknown } }>();
+  /** A finished flow answers the same way for this long, so a client whose reply was lost (a timeout) can ask again and still get its session. */
+  const FINAL_GRACE_MS = 60_000;
   const sweep = (now: number) => {
     for (const [k, f] of flows) if (f.expiresAt <= now) flows.delete(k);
   };
@@ -59,24 +61,33 @@ export function authRoutes(): Route<HubContext>[] {
       const flow = flows.get(deviceCode);
       // Unknown code and wrong secret are the same answer: nothing confirms that a device code exists.
       if (!flow || !timingSafeEqual(flow.secretHash, sha256(pollSecret))) throw new HttpError(404, "unknown device code");
+      const settled = () => flow.final;
+      let done = settled();
+      if (done) return json(res, done.status, done.body);
       const polled = await pollDeviceFlow(ctx.config, deviceCode);
+      done = settled(); // a concurrent poll may have finished the flow while this one waited on GitHub
+      if (done) return json(res, done.status, done.body);
       if (polled.kind === "pending") return json(res, 202, { pending: true });
       if (polled.kind === "slow_down") return json(res, 202, { pending: true, slowDown: true });
-      flows.delete(deviceCode);
-      if (polled.kind === "expired") return json(res, 410, { error: "expired" });
-      if (polled.kind === "denied") return json(res, 403, { reason: "denied" });
+      const finish = (status: number, body: unknown) => {
+        flow.final = { status, body };
+        flow.expiresAt = ctx.now() + FINAL_GRACE_MS;
+        json(res, status, body);
+      };
+      if (polled.kind === "expired") return finish(410, { error: "expired" });
+      if (polled.kind === "denied") return finish(403, { reason: "denied" });
       // The GitHub access token is used for this one lookup, then dropped.
       const user = await fetchGithubUser(ctx.config, polled.accessToken);
       const admission = bootstrapOrAdmit(ctx.db, user, ctx.now(), ctx.config.ownerLogin);
       if (!admission.ok) {
         ctx.log.info("sign-in refused", { githubId: user.id, login: user.login, reason: admission.reason });
-        return json(res, 403, { reason: admission.reason });
+        return finish(403, { reason: admission.reason });
       }
       const clientName = (req.headers["x-mergeport-client"] as string | undefined)?.slice(0, 100) ?? null;
       const session = createSession(ctx.db, admission.member.githubId, clientName, ctx.now());
       if (admission.joined) ctx.notify.team("member");
       ctx.log.info("sign-in", { githubId: user.id, login: user.login, role: admission.member.role });
-      json(res, 200, { session, member: memberJson(admission.member), team: teamJson(ctx) });
+      finish(200, { session, member: memberJson(admission.member), team: teamJson(ctx) });
     }),
     route<HubContext>("POST", "/auth/logout", (ctx, req, res) => {
       const s = requireSession(ctx, req);

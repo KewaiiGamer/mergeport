@@ -233,10 +233,36 @@ describe("device-flow sign-in", () => {
     expect((await hub.api()("POST", "/auth/device/poll", { deviceCode: "nope", pollSecret: s.pollSecret })).status).toBe(404);
     expect(hub.github.requests.filter((r) => r.path === "/login/oauth/access_token")).toHaveLength(0);
     expect((await pollOf(s)).status).toBe(200);
+    clock += 61_000; // past the grace period for a retried final poll
     expect((await pollOf(s)).status).toBe(404); // a finished flow is forgotten
     const late = await start();
     clock += 901_000; // past expiresIn
     expect((await pollOf(late)).status).toBe(404);
+  });
+
+  it("a final poll whose reply was lost can be asked again and returns the same session, for a minute", async () => {
+    hub.github.addUser({ id: 101n, login: "olive" });
+    const s = await start();
+    hub.github.authorize(s.userCode, 101n);
+    const first = await pollOf(s);
+    expect(first.status).toBe(200);
+    clock += 30_000;
+    const again = await pollOf(s);
+    expect(again.status).toBe(200);
+    expect(again.body.session).toBe(first.body.session);
+    expect(hub.github.requests.filter((r) => r.path === "/login/oauth/access_token")).toHaveLength(1); // answered from the stored result, not GitHub
+    clock += 31_000;
+    expect((await pollOf(s)).status).toBe(404);
+  });
+
+  it("a wrong poll secret still gets nothing during the grace period", async () => {
+    hub.github.addUser({ id: 101n, login: "olive" });
+    const s = await start();
+    hub.github.authorize(s.userCode, 101n);
+    expect((await pollOf(s)).status).toBe(200);
+    const wrong = await hub.api()("POST", "/auth/device/poll", { deviceCode: s.deviceCode, pollSecret: "x".repeat(43) });
+    expect(wrong.status).toBe(404);
+    expect(JSON.stringify(wrong.body)).not.toContain("session");
   });
 
   it("GitHub's slow_down is passed on as 202 slowDown", async () => {
