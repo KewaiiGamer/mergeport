@@ -8,7 +8,8 @@ import { repoWhere } from "@/lib/authz/viewer";
 import { formatDuration } from "@/lib/format";
 import { ActionForm } from "@/components/forms/ActionForm";
 import { Avatar, Banner, DemoBadge, EmptyState, Mono, PageHeader, Panel, SimplePill } from "@/components/ui/primitives";
-import { Building2, FolderGit2, GitFork, Globe, Lock, Plus, RefreshCw, Unplug, User, Users } from "@/components/ui/icons";
+import { Building2, FolderGit2, GitFork, Globe, Lock, Plus, RefreshCw, Unplug, User, Users, Zap } from "@/components/ui/icons";
+import { readCoverage } from "@/lib/hub/github-app-install";
 import { importPublicAction, refreshRepositoryAction, untrackRepositoryAction } from "@/app/actions";
 import { shareRepositoryAction, unshareRepositoryAction } from "@/app/team-actions";
 
@@ -19,6 +20,8 @@ export default async function Repositories({ searchParams }: { searchParams: Pro
   const showAll = (await searchParams).all === "1";
   const now = new Date();
   const [repos, spaces] = await Promise.all([listRepositories(db, viewer), db.space.findMany({ where: { access: "OK" }, orderBy: [{ kind: "asc" }, { name: "asc" }] })]);
+  // Repositories the team's GitHub App covers (last result of "Add my tracked repositories"; local data, no GitHub request).
+  const instant = await readCoverage(db).catch(() => new Set<string>());
   const spaceById = new Map(spaces.map((s) => [s.id, s]));
   const writable = spaces.filter((s) => s.canWrite);
   // A fork's parent name is shown only if that parent is not a tracked repository hidden from this viewer.
@@ -68,7 +71,7 @@ export default async function Repositories({ searchParams }: { searchParams: Pro
                 {(showAll ? repos : repos.slice(0, 30)).map((r) => (
                   <tr key={r.id}>
                     <td>
-                      <div className="flex items-center gap-2"><span className="font-medium [overflow-wrap:anywhere]">{r.name}</span>{r.archived && <SimplePill tone="unknown">Archived</SimplePill>}{r.isDemo && <DemoBadge />}</div>
+                      <div className="flex items-center gap-2"><span className="font-medium [overflow-wrap:anywhere]">{r.name}</span>{r.archived && <SimplePill tone="unknown">Archived</SimplePill>}{r.isDemo && <DemoBadge />}{instant.has(r.githubId.toString()) && <SimplePill tone="ok" icon={Zap}>Instant</SimplePill>}</div>
                       <p className="mt-0.5 text-[12px] text-ink-3">{r.isFork ? <span className="inline-flex items-center gap-1"><GitFork size={12} aria-hidden />fork of {r.parentGithubId !== null && hiddenParents.has(r.parentGithubId.toString()) ? <span>an upstream not shared with you</span> : <Mono>{r.parentFullName ?? "unknown"}</Mono>} · </span> : null}default branch <Mono>{r.defaultBranch ?? "unknown"}</Mono></p>
                       <p className="mt-0.5 text-[12px] text-ink-3">{r.lastSyncedAt ? `${r._count.workItems} open item${r._count.workItems === 1 ? "" : "s"}` : "Open items unknown until the first sync"}</p>
                     </td>

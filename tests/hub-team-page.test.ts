@@ -28,10 +28,14 @@ const spaces = [
   { id: "r1", kind: "RESTRICTED" as const, name: "Secret", canWrite: true, seq: "2" },
 ];
 
+const WEBHOOKS_OFF = { enabled: false, appSlug: null, lastDeliveryAt: null, lastEvent: null };
+
 function fakeApi(me: string, over: Partial<HubAdminApi> = {}) {
   const calls: string[] = [];
   const api: HubAdminApi = {
-    me: async () => ({ member: people.find((p) => p.githubId === me)!, team: { name: "Fake Team" }, members: people, spaces }),
+    me: async () => ({ member: people.find((p) => p.githubId === me)!, team: { name: "Fake Team" }, members: people, spaces, webhooks: WEBHOOKS_OFF }),
+    setGithubWebhook: async (s, slug) => void calls.push(`webhook:${s.length}:${slug ?? ""}`),
+    clearGithubWebhook: async () => void calls.push("webhook-off"),
     invite: async (l) => void calls.push(`invite:${l}`),
     removeMember: async (id) => void calls.push(`remove:${id}`),
     removedMembers: async () => [member("9", "gone", "MEMBER", "REMOVED")],
