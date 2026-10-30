@@ -33,7 +33,10 @@ export async function addTrackedRepositoriesAction(): Promise<ActionResult> {
     const parts: string[] = [];
     if (report.added.length) parts.push(`Added ${report.added.length} ${report.added.length === 1 ? "repository" : "repositories"} to the App.`);
     if (!report.added.length && !report.failed.length) parts.push("Every repository you track is already covered.");
-    if (report.failed.length) parts.push(`Install it on this repository on GitHub: ${report.failed.map((f) => f.fullName).join(", ")}.`);
+    const names = (reason: string) => report.failed.filter((f) => f.reason === reason).map((f) => f.fullName).join(", ");
+    if (names("install-on-github")) parts.push(`Install it on this repository on GitHub: ${names("install-on-github")}.`);
+    if (names("try-again-later")) parts.push(`GitHub asked Mergeport to slow down. Try again later for: ${names("try-again-later")}.`);
+    if (names("failed")) parts.push(`Something went wrong for: ${names("failed")}. Nothing was changed there. Try again.`);
     return report.failed.length ? { ok: false, error: parts.join(" ") } : { ok: true, message: parts.join(" ") };
   });
 }

@@ -6,6 +6,9 @@ import { appEvents, appPermissions, stripSlash } from "@/lib/hub/github-app-mani
 /** Where a person installs the team's App on their repositories. */
 export const installUrl = (appSlug: string) => `https://github.com/apps/${encodeURIComponent(appSlug)}/installations/new`;
 
+/** DiscoveryCache key of the last "Add my tracked repositories" result (see github-app-install.ts). */
+export const COVERAGE_KEY = "github-app-coverage";
+
 export const DAY_MS = 24 * 3600 * 1000;
 
 export type WebhookStatus = { kind: "on" | "waiting" | "quiet" | "off"; text: string };

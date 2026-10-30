@@ -304,6 +304,20 @@ describe("actions", () => {
     expect((r as { error: string }).error).toContain("Install it on this repository on GitHub: acme/two.");
   });
 
+  it("saves the coverage when some additions worked and a later one failed, and says what failed in plain words", async () => {
+    const ws = await seedRepos();
+    const owner = await h.db.githubOwner.findFirstOrThrow();
+    await h.db.repository.create({ data: { workspaceId: ws.id, githubId: 14n, ownerId: owner.id, name: "four", fullName: "acme/four", htmlUrl: "https://github.com/acme/four" } });
+    mockApi(apiFor("2", { enabled: true, appSlug: "team-app", lastDeliveryAt: null, lastEvent: null }), "2");
+    github({ "14": 500 });
+    const { addTrackedRepositoriesAction } = await import("@/app/hub-webhook-actions");
+    const r = await addTrackedRepositoriesAction();
+    expect(r).toMatchObject({ ok: false });
+    expect((r as { error: string }).error).toContain("Added 1 repository to the App.");
+    expect((r as { error: string }).error).toContain("Something went wrong for: acme/four.");
+    expect([...(await readCoverage(h.db, "team-app"))].sort()).toEqual(["11", "12"]);
+  });
+
   it("refuses before any GitHub request when the App is not set up", async () => {
     await seedRepos();
     mockApi(apiFor("2", OFF), "2");
@@ -332,10 +346,52 @@ describe("actions", () => {
     await saveCoverage(h.db, { appSlug: "team-app", checkedAt: new Date().toISOString(), covered: ["11"] });
     expect(await turnOffInstantUpdatesAction()).toMatchObject({ ok: true });
     expect(calls).toEqual(["set:64:team-app", "set:64:", "clear"]);
-    expect((await readCoverage(h.db)).size).toBe(0);
+    expect((await readCoverage(h.db, "team-app")).size).toBe(0);
     mockApi(apiFor("3", OFF, calls), "3");
     expect(await saveWebhookSecretAction(fd({ secret: "c".repeat(64) }))).toMatchObject({ ok: false, error: "Only the owner can set up instant GitHub updates." });
     expect(await turnOffInstantUpdatesAction()).toMatchObject({ ok: false });
     expect(calls).toHaveLength(3);
+  });
+});
+
+describe("the Instant badge", () => {
+  const on = (appSlug: string | null, enabled = true) => mockApi(apiFor("3", { enabled, appSlug, lastDeliveryAt: null, lastEvent: null }), "3");
+  const stored = (appSlug = "team-app") => saveCoverage(h.db, { appSlug, checkedAt: new Date().toISOString(), covered: ["11", "12"] });
+
+  it("shows only while the hub's webhooks are enabled and its App is the one the result was stored for", async () => {
+    const { instantRepoIds } = await import("@/lib/hub/instant-badges");
+    await stored();
+    on("team-app");
+    expect([...(await instantRepoIds(h.db))].sort()).toEqual(["11", "12"]);
+    on("replacement-app"); // the App was replaced: the old result is stale
+    expect((await instantRepoIds(h.db)).size).toBe(0);
+    on("team-app", false); // turned off on the hub
+    expect((await instantRepoIds(h.db)).size).toBe(0);
+    on(null);
+    expect((await instantRepoIds(h.db)).size).toBe(0);
+  });
+
+  it("asks nothing without a stored result, and shows no badge when the hub cannot be asked", async () => {
+    const { instantRepoIds } = await import("@/lib/hub/instant-badges");
+    on("team-app");
+    expect((await instantRepoIds(h.db)).size).toBe(0);
+    expect(h.getHubTeamService).not.toHaveBeenCalled();
+    await stored();
+    h.getHubTeamService.mockResolvedValue({ svc: new HubTeamService({ ...apiFor("3", OFF), me: async () => { throw new HubRequestError("down", 0); } }, "3"), dbFile: "x.db", origin: ORIGIN });
+    expect((await instantRepoIds(h.db)).size).toBe(0);
+  });
+
+  it("readCoverage is empty for an unknown or different slug", async () => {
+    await stored();
+    expect((await readCoverage(h.db, null)).size).toBe(0);
+    expect((await readCoverage(h.db, "other")).size).toBe(0);
+    expect((await readCoverage(h.db, "team-app")).size).toBe(2);
+  });
+
+  it("leaving the team clears the stored coverage", async () => {
+    const { leaveTeamLocally } = await import("@/lib/team/leave");
+    await stored();
+    await leaveTeamLocally(h.db);
+    expect(await h.db.discoveryCache.findUnique({ where: { key: "github-app-coverage" } })).toBeNull();
   });
 });

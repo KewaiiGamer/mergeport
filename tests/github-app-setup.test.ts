@@ -102,7 +102,7 @@ describe("manifest conversion", () => {
 });
 
 /** GitHub on a map: installations, their repositories, and which PUTs are refused. */
-function fakeGithub(o: { installations: { id: number; app_slug: string; account: string }[]; repos: Record<number, number[]>; put?: Record<string, number>; listStatus?: number }) {
+function fakeGithub(o: { installations: { id: number; app_slug: string; account: string }[]; repos: Record<number, number[]>; put?: Record<string, number>; listStatus?: number; repoListStatus?: number; rateLimited?: string[] }) {
   const calls: string[] = [];
   const f = (async (url: string, init: RequestInit = {}) => {
     const u = new URL(url);
@@ -113,9 +113,11 @@ function fakeGithub(o: { installations: { id: number; app_slug: string; account:
       return json(200, { total_count: o.installations.length, installations: o.installations.map((i) => ({ id: i.id, app_slug: i.app_slug, repository_selection: "selected", account: { login: i.account } })) });
     }
     const list = /^\/user\/installations\/(\d+)\/repositories$/.exec(u.pathname);
+    if (method === "GET" && list && o.repoListStatus) return json(o.repoListStatus, { message: "no" });
     if (method === "GET" && list) return json(200, { total_count: 0, repositories: (o.repos[Number(list[1])] ?? []).map((id) => ({ id })) });
     const put = /^\/user\/installations\/(\d+)\/repositories\/(\d+)$/.exec(u.pathname);
     if (method === "PUT" && put) {
+      if (o.rateLimited?.includes(put[2])) return new Response(JSON.stringify({ message: "API rate limit exceeded" }), { status: 403, headers: { "retry-after": "30" } });
       const status = o.put?.[put[2]] ?? 204;
       return status === 204 ? new Response(null, { status }) : json(status, { message: "refused" });
     }
@@ -151,15 +153,38 @@ describe("installation helper", () => {
   it("reports 403 and 404 per repository and keeps going; one failure does not hide the rest", async () => {
     const gh = fakeGithub({ installations: [{ id: 1, app_slug: "team-app", account: "acme" }], repos: { 1: [] }, put: { "11": 403, "12": 404 } });
     const r = await addTrackedRepositories(gh.rest, "team-app", tracked.slice(0, 3));
-    expect(r.failed).toEqual([{ fullName: "acme/one", status: 403 }, { fullName: "acme/two", status: 404 }]);
+    expect(r.failed).toEqual([{ fullName: "acme/one", status: 403, reason: "install-on-github" }, { fullName: "acme/two", status: 404, reason: "install-on-github" }]);
     expect(r.added).toEqual(["acme/three"]);
     expect(r.covered).toEqual(["13"]);
+  });
+
+  it("a rate limit (a 403 too) stops the loop: that repository and the rest are try-again-later, nothing is called after it, earlier adds are kept", async () => {
+    const gh = fakeGithub({ installations: [{ id: 1, app_slug: "team-app", account: "acme" }], repos: { 1: [] }, rateLimited: ["12"] });
+    const r = await addTrackedRepositories(gh.rest, "team-app", tracked.slice(0, 3));
+    expect(r.added).toEqual(["acme/one"]);
+    expect(r.covered).toEqual(["11"]);
+    expect(r.failed).toEqual([{ fullName: "acme/two", status: null, reason: "try-again-later" }, { fullName: "acme/three", status: null, reason: "try-again-later" }]);
+    expect(gh.calls.filter((c) => c.startsWith("PUT"))).toEqual(["PUT /user/installations/1/repositories/11", "PUT /user/installations/1/repositories/12"]);
+  });
+
+  it("any other error is recorded for that repository only and the loop continues", async () => {
+    const gh = fakeGithub({ installations: [{ id: 1, app_slug: "team-app", account: "acme" }], repos: { 1: [] }, put: { "11": 500, "12": 422 } });
+    const r = await addTrackedRepositories(gh.rest, "team-app", tracked.slice(0, 3));
+    expect(r.failed).toEqual([{ fullName: "acme/one", status: null, reason: "failed" }, { fullName: "acme/two", status: null, reason: "failed" }]);
+    expect(r.added).toEqual(["acme/three"]);
+  });
+
+  it("a refusal while listing an installation's repositories is cannot-list, like the installations list", async () => {
+    for (const repoListStatus of [403, 404]) {
+      const r = await addTrackedRepositories(fakeGithub({ installations: [{ id: 1, app_slug: "team-app", account: "acme" }], repos: {}, repoListStatus }).rest, "team-app", tracked);
+      expect(r).toMatchObject({ state: "cannot-list", added: [], covered: [] });
+    }
   });
 
   it("does not ask for a repository whose owner has no installation of the App; it reports it", async () => {
     const gh = fakeGithub({ installations: [{ id: 1, app_slug: "team-app", account: "acme" }], repos: { 1: [11] } });
     const r = await addTrackedRepositories(gh.rest, "team-app", [tracked[0], tracked[3]]);
-    expect(r.failed).toEqual([{ fullName: "other/four", status: null }]);
+    expect(r.failed).toEqual([{ fullName: "other/four", status: null, reason: "install-on-github" }]);
     expect(gh.calls.filter((c) => c.startsWith("PUT"))).toEqual([]);
   });
 

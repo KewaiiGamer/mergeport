@@ -9,7 +9,7 @@ import { formatDuration } from "@/lib/format";
 import { ActionForm } from "@/components/forms/ActionForm";
 import { Avatar, Banner, DemoBadge, EmptyState, Mono, PageHeader, Panel, SimplePill } from "@/components/ui/primitives";
 import { Building2, FolderGit2, GitFork, Globe, Lock, Plus, RefreshCw, Unplug, User, Users, Zap } from "@/components/ui/icons";
-import { readCoverage } from "@/lib/hub/github-app-install";
+import { instantRepoIds } from "@/lib/hub/instant-badges";
 import { importPublicAction, refreshRepositoryAction, untrackRepositoryAction } from "@/app/actions";
 import { shareRepositoryAction, unshareRepositoryAction } from "@/app/team-actions";
 
@@ -21,7 +21,7 @@ export default async function Repositories({ searchParams }: { searchParams: Pro
   const now = new Date();
   const [repos, spaces] = await Promise.all([listRepositories(db, viewer), db.space.findMany({ where: { access: "OK" }, orderBy: [{ kind: "asc" }, { name: "asc" }] })]);
   // Repositories the team's GitHub App covers (last result of "Add my tracked repositories"; local data, no GitHub request).
-  const instant = await readCoverage(db).catch(() => new Set<string>());
+  const instant = await instantRepoIds(db);
   const spaceById = new Map(spaces.map((s) => [s.id, s]));
   const writable = spaces.filter((s) => s.canWrite);
   // A fork's parent name is shown only if that parent is not a tracked repository hidden from this viewer.
