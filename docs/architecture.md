@@ -138,6 +138,10 @@ Per-space state shown to the person: **Pending, Syncing, Synced, Offline, Confli
 
 **Schema skew.** A space or entity file with a newer schema is read-only (`SCHEMA_NEWER`); unknown entity files are skipped and never rewritten by an older client.
 
+## Hub webhook relay (server)
+
+The hub can relay GitHub webhooks (`hub/src/webhook-routes.ts`, `hub/src/settings.ts`, `GithubRelay` in `hub/src/notify.ts`). `POST /webhooks/github` is authenticated only by the HMAC-SHA256 signature (`X-Hub-Signature-256`) over the raw body (1 MiB cap) with the GitHub App's webhook secret, stored in the hub's `setting` table (owner-only `PUT`/`DELETE /admin/github-webhook`; env fallback `MERGEPORT_HUB_GITHUB_WEBHOOK_SECRET`). A verified delivery is parsed in memory, deduplicated by `X-GitHub-Delivery` for 10 minutes, and sent as `{t:"gh",repoId,event,delivery,payload}` to each WebSocket connection that listed the repository in its `{t:"watch",repos}` message and may see it (public repository, the member owns it, or it is shared through a space the member can read). Nothing from a delivery is stored or logged, and the apps keep their 15-minute cycle as the safety net. Design: `docs/superpowers/specs/2026-10-30-github-webhook-instant-updates-design.md`.
+
 ## Hub backend (client)
 
 A team may sync through a Mergeport hub (HTTP plus WebSocket) instead of a GitHub coordination repository. This section describes the client half that exists in `src/lib/hub/` and `src/lib/sync/engine.ts`. It is not wired into the running app yet (see "What plan 3 must wire").

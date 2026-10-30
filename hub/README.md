@@ -43,6 +43,7 @@ MERGEPORT_HUB_TRUST_PROXY=true
 | `MERGEPORT_HUB_PORT` | no | `8787` | Listen port. |
 | `MERGEPORT_HUB_TRUST_PROXY` | no | `false` | Set `true` only when a reverse proxy fronts the hub (the Caddy setup below): it binds `127.0.0.1` only and takes the client IP from the rightmost `X-Forwarded-For` entry (used for rate limits). The default `false` uses the socket address and binds `0.0.0.0` only when the public URL is https (otherwise still loopback). Never leave it `false` behind a proxy (every client would share the proxy's rate limit) and never set `true` when clients can reach the hub directly (they could spoof the header). |
 | `MERGEPORT_HUB_BIND_HOST` | no | derived | Explicit bind address, overriding the rule above. Set `0.0.0.0` inside a container that a reverse proxy reaches over a Docker network (the Docker setup below); never expose that container's port on the host. |
+| `MERGEPORT_HUB_GITHUB_WEBHOOK_SECRET` | no | | Fallback webhook secret (32 to 256 characters), used only while the hub's database holds none. Normally leave it unset: the owner saves the secret from the Mergeport app (see "Instant GitHub updates" below). |
 | `MERGEPORT_HUB_GITHUB_API_BASE` | no | `https://api.github.com` | Tests only. Points the hub at a fake GitHub API. |
 | `MERGEPORT_HUB_GITHUB_OAUTH_BASE` | no | `https://github.com` | Tests only. Points the hub at a fake GitHub OAuth host. |
 
@@ -145,10 +146,29 @@ Stop the hub, `git pull`, `npm ci`, start it. Migrations apply at start. A datab
 - **Event log pruning**: old events are pruned. Sessions with no cursor for a space do not hold pruning back. A client whose `since` has been pruned gets `410` and re-snapshots that space.
 - **Logs**: one JSON line per request (`method`, `path`, `status`, `ms`, `member` when known). Never bodies, query strings, session tokens, GitHub tokens, device codes or user codes.
 
+## Instant GitHub updates (webhook endpoint)
+
+The hub can relay GitHub webhooks to the Mergeport apps that track the repository, so a change on GitHub shows within about a second without each person spending their GitHub rate limit. The owner sets this up from the Mergeport app (Team page, "Instant GitHub updates"): the app creates a GitHub App whose webhook URL is `https://<your hub>/webhooks/github` and saves its webhook secret on the hub with `PUT /admin/github-webhook` (owner only). The owner does not edit the server. `DELETE /admin/github-webhook` turns it off. Without a secret the endpoint answers `404`, and hubs without it behave as before.
+
+How it works:
+
+- `POST /webhooks/github` has no bearer token. It is authenticated only by `X-Hub-Signature-256`, the HMAC-SHA256 of the raw body with the secret (compared in constant time). The body is capped at 1 MiB (`413`); a missing or wrong signature is `401` and nothing else happens.
+- `ping`, `installation` and `installation_repositories` are recorded (`GET /me` shows `webhooks.lastDeliveryAt` and `lastEvent`, held in memory) and not relayed. `issues`, `issue_comment`, `pull_request`, `pull_request_review`, `pull_request_review_comment`, `pull_request_review_thread`, `check_run`, `check_suite`, `status`, `push`, `create` and `delete` are relayed over the WebSocket as `{"t":"gh", ...}` to the connections that asked for that repository (`{"t":"watch","repos":[...]}`) and are allowed to see it: the repository is public, or its owner login is the member's, or it is shared through a space the member can read. Everyone else's app catches up on its 15-minute cycle. Any other event is ignored (`202`).
+- Deliveries repeated within 10 minutes (same `X-GitHub-Delivery`) are relayed once. The endpoint shares one bucket of 600 requests per minute (`429` above it). A payload over 256 KiB is relayed as `payload: null`, which makes the app fetch instead.
+- Logs carry the event name, the repository id and the number of sockets notified. Never a body, a title, a signature or the secret.
+
+Security notes:
+
+- The endpoint is public and authenticated by HMAC with the App's webhook secret, which lives in the hub's database file (a backup of `hub.db` contains it). It proves a delivery came from GitHub and grants no repository access.
+- The hub holds a delivery in memory only while verifying and relaying it. It relays full payloads, which may contain private repository content, only to connections allowed by the audience rule above. Apps trust the hub (they already trust it for shared data).
+- The App is created with read-only permissions. Its private key and client secret are discarded unread.
+- Cloudflare in front: if Bot Fight Mode or a WAF rule challenges `GitHub-Hookshot/*`, add a skip rule for `/webhooks/github`; failures show in the App's Recent deliveries.
+
 ## What the hub stores
 
 - Members (GitHub id, login, name, avatar URL), roles, invites
 - Sessions, as SHA-256 hashes of the token, with expiry and client name
 - Spaces, space membership, and the synced entity records and their change log
+- The GitHub App's webhook secret and slug, when instant updates are set up (table `setting`)
 
 It never stores GitHub tokens: the access token from sign-in is used once to read your GitHub profile and is then dropped. It stores no source code, no issues and no pull requests; GitHub stays the source of truth for those.
