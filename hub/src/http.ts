@@ -13,19 +13,43 @@ export function json(res: ServerResponse, status: number, body: unknown, headers
   res.end(text);
 }
 
-/** The whole body as a Buffer, untouched. Drains an oversized body so the 413 reaches the client. */
-export async function readRaw(req: IncomingMessage, limitBytes: number): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  let size = 0;
-  let tooBig = false;
-  for await (const chunk of req) {
-    const buf = chunk as Buffer;
-    size += buf.length;
-    if (size > limitBytes) tooBig = true;
-    if (!tooBig) chunks.push(buf);
-  }
-  if (tooBig) throw new HttpError(413, "body too large", { connection: "close" });
-  return Buffer.concat(chunks);
+/** The whole body as a Buffer, untouched. Past the limit it stops reading at once: 413, and the socket is destroyed once the answer is out (no draining). */
+export function readRaw(req: IncomingMessage, res: ServerResponse, limitBytes: number): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    const done = () => {
+      req.off("data", onData);
+      req.off("end", onEnd);
+      req.off("error", onError);
+      req.off("close", onClose);
+    };
+    const onData = (buf: Buffer) => {
+      size += buf.length;
+      if (size <= limitBytes) return void chunks.push(buf);
+      done();
+      // Unread data left in the socket would turn the close into a reset that can swallow the 413: discard briefly, then cut.
+      req.resume();
+      res.once("finish", () => setTimeout(() => req.destroy(), 250).unref());
+      reject(new HttpError(413, "body too large", { connection: "close" }));
+    };
+    const onEnd = () => {
+      done();
+      resolve(Buffer.concat(chunks));
+    };
+    const onClose = () => {
+      done();
+      reject(new HttpError(400, "aborted"));
+    };
+    const onError = (e: Error) => {
+      done();
+      reject(e);
+    };
+    req.on("data", onData);
+    req.on("end", onEnd);
+    req.on("error", onError);
+    req.on("close", onClose);
+  });
 }
 
 export async function readJson<T>(req: IncomingMessage, schema: ZodType<T>, limitBytes = 1_000_000): Promise<T> {

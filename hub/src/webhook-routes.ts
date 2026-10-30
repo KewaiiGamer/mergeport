@@ -12,6 +12,8 @@ export const MAX_WEBHOOK_BODY = 1024 * 1024;
 export const MAX_RELAY_PAYLOAD = 256 * 1024;
 const DEDUPE_MS = 10 * 60 * 1000;
 const DEDUPE_MAX = 5000;
+/** Bodies being read at once; the next one is refused before its body is read. */
+const MAX_INFLIGHT = 16;
 const BUCKET = { key: "webhook:github", limit: 600, windowMs: 60_000 };
 
 /** Recorded in the status, never relayed. */
@@ -48,6 +50,7 @@ export function webhookRoutes(): Route<HubContext>[] {
     return s.member;
   };
   /** Delivery id -> time first seen. Insertion order is time order, so the oldest entries are at the front. */
+  let inflight = 0;
   const seen = new Map<string, number>();
 
   return [
@@ -73,7 +76,14 @@ export function webhookRoutes(): Route<HubContext>[] {
     route<HubContext>("POST", "/webhooks/github", async (ctx, req, res) => {
       const secret = ctx.webhooks.secret();
       if (!secret) throw new HttpError(404, "not found");
-      const raw = await readRaw(req, MAX_WEBHOOK_BODY);
+      if (inflight >= MAX_INFLIGHT) throw new HttpError(503, "busy", { "retry-after": "1", connection: "close" });
+      inflight++;
+      let raw: Buffer;
+      try {
+        raw = await readRaw(req, res, MAX_WEBHOOK_BODY);
+      } finally {
+        inflight--;
+      }
       if (!validSignature(secret, raw, header(req, "x-hub-signature-256"))) throw new HttpError(401, "invalid signature");
 
       const event = header(req, "x-github-event") ?? "";
@@ -90,9 +100,11 @@ export function webhookRoutes(): Route<HubContext>[] {
       } catch {
         throw new HttpError(400, "invalid json");
       }
-      const repo = (parsed as { repository?: { id?: unknown; private?: unknown; owner?: { login?: unknown } } } | null)?.repository;
+      const repo = (parsed as { repository?: { id?: unknown; private?: unknown; owner?: { login?: unknown; id?: unknown } } } | null)?.repository;
       const id = repo?.id;
       const ownerLogin = repo?.owner?.login;
+      const rawOwnerId = repo?.owner?.id;
+      const ownerId = typeof rawOwnerId === "number" && Number.isInteger(rawOwnerId) && rawOwnerId >= 0 ? rawOwnerId : null;
       if (typeof id !== "number" || !Number.isInteger(id) || id < 0 || typeof repo?.private !== "boolean" || typeof ownerLogin !== "string") throw new HttpError(400, "invalid payload");
 
       const delivery = header(req, "x-github-delivery");
@@ -107,10 +119,11 @@ export function webhookRoutes(): Route<HubContext>[] {
       const taken = ctx.limiter.take(BUCKET.key, BUCKET.limit, BUCKET.windowMs);
       if (!taken.ok) throw new HttpError(429, "rate limited", { "retry-after": String(taken.retryAfterSec) });
 
+      const repoId = String(id);
+      const notified = ctx.notify.github({ repoId, isPrivate: repo.private, ownerLogin, ownerId, event, delivery: deliveryId, payload: raw.length > MAX_RELAY_PAYLOAD ? null : parsed });
+      // Remembered only after the relay succeeded: a failed one is processed again on redelivery.
       seen.set(deliveryId, t);
       while (seen.size > DEDUPE_MAX) seen.delete(seen.keys().next().value as string);
-      const repoId = String(id);
-      const notified = ctx.notify.github({ repoId, isPrivate: repo.private, ownerLogin, event, delivery: deliveryId, payload: raw.length > MAX_RELAY_PAYLOAD ? null : parsed });
       ctx.webhooks.record(event, t);
       ctx.log.info("github webhook", { event, repoId, notified });
       json(res, 200, { ok: true, notified });

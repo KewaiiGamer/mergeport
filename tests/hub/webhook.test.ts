@@ -324,28 +324,31 @@ describe("audience", () => {
     expect(sp.status).toBe(201);
     await shareRepo(olive, sp.body.space.id, "r104", 104);
 
-    const all = ["101", "102", "103", "104", "105", "106", "107", "108"];
+    const all = ["101", "102", "103", "104", "105", "106", "107", "108", "109", "110", "111"];
     await cBob.watch(all);
     await cCarol.watch(all);
     await cOlive.watch(all);
     await cDave.watch([]); // connected, watches nothing
 
-    const send = (id: number, owner: string, isPrivate: boolean) => deliver(hub, SECRET, "issues", issue(ghRepo(id, owner, isPrivate)), { delivery: `aud-${id}` });
+    const send = (id: number, owner: string, isPrivate: boolean, ownerId?: number) => deliver(hub, SECRET, "issues", issue(ghRepo(id, owner, isPrivate, ownerId)), { delivery: `aud-${id}` });
     await send(101, "someone", false); // public: every watcher
-    await send(102, "BOB", true); // private, owner login matches bob case-insensitively
+    await send(102, "BOB", true, 2); // private, owner id is bob's
     await send(103, "someone", true); // private, shared in common: all who can read common
     await send(104, "someone", true); // private, shared in restricted space: olive and bob only
     await send(105, "someone", true); // private, nobody: nobody
     await send(106, "someone", true); // string githubId in the entity
     await send(107, "someone", true); // entity deleted
-    await send(108, "olive", true); // private owned by olive
+    await send(108, "olive", true, 1); // private owned by olive (by id)
+    await send(109, "olive", true, 999); // same login as olive, different id: nobody
+    await send(110, "renamed", true, 2); // id is bob's, login is not: bob
+    await send(111, "CAROL", true); // no owner id in the payload: login fallback, case-insensitive
     await cBob.watch(all); // barrier: handled after every relay above was queued
     await cCarol.watch(all);
     await cOlive.watch(all);
 
     const got = (c: Client) => c.gh().map((m) => m.repoId);
-    expect(got(cBob)).toEqual(["101", "102", "103", "104", "106"]);
-    expect(got(cCarol)).toEqual(["101", "103", "106"]);
+    expect(got(cBob)).toEqual(["101", "102", "103", "104", "106", "110"]);
+    expect(got(cCarol)).toEqual(["101", "103", "106", "111"]);
     expect(got(cOlive)).toEqual(["101", "103", "104", "106", "108"]);
     expect(got(cDave)).toEqual([]);
   });

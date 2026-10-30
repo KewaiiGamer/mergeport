@@ -13,6 +13,13 @@ export const WS_COALESCE_MS = 100;
 const CLOSE_GRACE_MS = 1000;
 /** Client frames: a 2000-id watch message is about 40 KB. */
 const MAX_CLIENT_FRAME = 64 * 1024;
+/** Every client message except `watch` must fit here. */
+const SMALL_FRAME = 4096;
+/** More than this many client frames inside the window closes the socket (1008). A ping every 25 s is far below it. */
+const FRAME_BUDGET = 30;
+const FRAME_WINDOW_MS = 10_000;
+/** Shared-space lookup; the expression text must match the `entity_repo_github` index so SQLite uses it. */
+export const SHARED_REPO_SQL = "SELECT DISTINCT space_id FROM entity WHERE type = 'repo' AND deleted = 0 AND json_extract(data, '$.githubId') IN (?, ?)";
 /** Most repositories one connection may watch. */
 export const MAX_WATCH = 2000;
 const PROTOCOL = "mergeport.v1";
@@ -48,9 +55,9 @@ export type Notifier = {
   shutdown(): Promise<void>;
 };
 
-export type GithubRelay = { repoId: string; isPrivate: boolean; ownerLogin: string; event: string; delivery: string; payload: unknown };
+export type GithubRelay = { repoId: string; isPrivate: boolean; ownerLogin: string; /** GitHub numeric id of the owner, when the payload has one; it decides over the login. */ ownerId: number | null; event: string; delivery: string; payload: unknown };
 
-type Conn = { watch: Set<string>; ws: WebSocket; token: string; idHash: string; githubId: bigint; silence: NodeJS.Timeout | null; grace: NodeJS.Timeout | null };
+type Conn = { frames: number[]; watch: Set<string>; ws: WebSocket; token: string; idHash: string; githubId: bigint; silence: NodeJS.Timeout | null; grace: NodeJS.Timeout | null };
 
 const reject = (socket: Duplex, status: number, text: string) => {
   const body = `HTTP/1.1 ${status} ${text}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`;
@@ -79,12 +86,12 @@ export function createNotifier(deps: NotifierDeps): Notifier {
   const send = (c: Conn, msg: Record<string, unknown>) => {
     if (c.ws.readyState === c.ws.OPEN) c.ws.send(JSON.stringify(msg));
   };
-  const closeConn = (c: Conn, code: number, bye?: "removed" | "shutdown") => {
+  const closeConn = (c: Conn, code: number, bye?: "removed" | "shutdown", reason?: string) => {
     if (bye) send(c, { t: "bye", reason: bye });
     if (c.silence) clearTimeout(c.silence);
     c.silence = null;
     if (c.ws.readyState === c.ws.OPEN || c.ws.readyState === c.ws.CONNECTING) {
-      c.ws.close(code, bye ?? "unauthorized");
+      c.ws.close(code, reason ?? bye ?? "unauthorized");
       c.grace ??= setTimeout(() => c.ws.terminate(), CLOSE_GRACE_MS);
       c.grace.unref();
     }
@@ -140,11 +147,11 @@ export function createNotifier(deps: NotifierDeps): Notifier {
       // why, and close as kick() does, so the client learns it was removed instead of reconnecting forever.
       return wss.handleUpgrade(req, socket, head, (ws) => {
         ws.on("error", () => ws.terminate());
-        closeConn({ ws, token, idHash: session.idHash, githubId: member.githubId, silence: null, grace: null, watch: new Set() }, CLOSE_REMOVED, "removed");
+        closeConn({ ws, token, idHash: session.idHash, githubId: member.githubId, silence: null, grace: null, watch: new Set(), frames: [] }, CLOSE_REMOVED, "removed");
       });
     }
     wss.handleUpgrade(req, socket, head, (ws) => {
-      const c: Conn = { ws, token, idHash: session.idHash, githubId: member.githubId, silence: null, grace: null, watch: new Set() };
+      const c: Conn = { ws, token, idHash: session.idHash, githubId: member.githubId, silence: null, grace: null, watch: new Set(), frames: [] };
       conns.add(c);
       armSilence(c);
       deps.log?.info("ws open", { member: member.githubId.toString(), sockets: conns.size });
@@ -157,11 +164,17 @@ export function createNotifier(deps: NotifierDeps): Notifier {
       });
       ws.on("message", (raw, isBinary) => {
         armSilence(c);
+        const nowMs = Date.now();
+        c.frames.push(nowMs);
+        while (c.frames.length > 0 && c.frames[0] <= nowMs - FRAME_WINDOW_MS) c.frames.shift();
+        if (c.frames.length > FRAME_BUDGET) return closeConn(c, 1008, undefined, "too many messages");
         const m = authenticate(c, true);
         if (!m || isBinary) return;
         try {
           const msg = JSON.parse(raw.toString()) as { t?: unknown } | null;
           if (!msg || typeof msg !== "object") return;
+          // Only `watch` may exceed the small frame limit.
+          if (raw.toString().length > SMALL_FRAME && msg.t !== "watch") return closeConn(c, 1009, undefined, "message too big");
           if (msg.t === "ping") send(c, { t: "pong" });
           else if (msg.t === "watch") {
             const repos = (msg as { repos?: unknown }).repos;
@@ -210,9 +223,9 @@ export function createNotifier(deps: NotifierDeps): Notifier {
       for (const c of watchers) {
         const m = authenticate(c);
         if (!m) continue;
-        let allowed = !r.isPrivate || m.login.toLowerCase() === r.ownerLogin.toLowerCase();
+        let allowed = !r.isPrivate || (r.ownerId !== null ? m.githubId === BigInt(r.ownerId) : m.login.toLowerCase() === r.ownerLogin.toLowerCase());
         if (!allowed) {
-          sharedIn ??= (deps.db.prepare("SELECT DISTINCT space_id FROM entity WHERE type = 'repo' AND deleted = 0 AND CAST(json_extract(data, '$.githubId') AS TEXT) = ?").all(r.repoId) as { space_id: string }[]).map((x) => x.space_id);
+          sharedIn ??= (deps.db.prepare(SHARED_REPO_SQL).all(BigInt(r.repoId), r.repoId) as { space_id: string }[]).map((x) => x.space_id);
           allowed = sharedIn.some((id) => spaceAccess(deps.db, m, id).canRead);
         }
         if (allowed && c.ws.readyState === c.ws.OPEN) {

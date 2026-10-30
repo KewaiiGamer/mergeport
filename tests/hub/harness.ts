@@ -190,7 +190,7 @@ export const signBody = (secret: string, body: string | Buffer): string => `sha2
 
 let deliverySeq = 0;
 /** A repository object as GitHub puts it in every webhook payload. */
-export const ghRepo = (id: number, owner: string, isPrivate = false) => ({ id, private: isPrivate, owner: { login: owner }, full_name: `${owner}/repo${id}` });
+export const ghRepo = (id: number, owner: string, isPrivate = false, ownerId?: number) => ({ id, private: isPrivate, owner: ownerId === undefined ? { login: owner } : { login: owner, id: ownerId }, full_name: `${owner}/repo${id}` });
 
 /** Posts a delivery to /webhooks/github, signed with `secret` unless `signature` overrides it (null sends none). `payload` may be a ready string. */
 export async function deliver(
