@@ -16,8 +16,21 @@ export class FakeSocket {
   sent: string[] = [];
   closed = false;
   constructor(readonly member: Member | null, private hub: FakeHub) {}
+  /** The set from the last `{ t: "watch" }` this socket sent (the hub replaces the set each time), as a real hub keeps it. */
+  watched = new Set<string>();
+  /** Every `watch` message in send order (the repos array of each). */
+  watches: string[][] = [];
   send(data: string) {
     this.sent.push(data);
+    try {
+      const m = JSON.parse(data) as { t?: string; repos?: unknown };
+      if (m.t === "watch" && Array.isArray(m.repos)) {
+        this.watches.push(m.repos.map(String));
+        this.watched = new Set(m.repos.slice(0, 2000).map(String));
+      }
+    } catch {
+      // not JSON: only recorded
+    }
   }
   close(code = 1000) {
     this.deliverClose(code);
@@ -76,6 +89,19 @@ export class FakeHub {
     const m = this.members.get(githubId);
     if (m) m.role = role;
   }
+  /** Relays a GitHub webhook delivery the way the hub does: to every connection that watches `repoId`, in arrival order. Returns how many got it. */
+  relayGithub(repoId: string, event: string, payload: unknown | null, delivery = `d-${++this.deliveries}`): number {
+    let n = 0;
+    for (const k of this.sockets) {
+      if (!k.watched.has(repoId)) continue;
+      k.deliver({ t: "gh", repoId, event, delivery, payload });
+      n++;
+    }
+    return n;
+  }
+  private deliveries = 0;
+  /** Webhook status answered by GET /me. */
+  webhooks = { enabled: false, appSlug: null as string | null, lastDeliveryAt: null as string | null, lastEvent: null as string | null };
   /** Simulates a restored or rebuilt hub: its sequence goes back to `seq` and no history is kept. */
   resetSeq(spaceId: string, seq = 0n) {
     const s = this.spaces.get(spaceId)!;
@@ -211,7 +237,7 @@ export class FakeHub {
     if (url.pathname === "/me") {
       const members = [...this.members.values()].map((x) => ({ githubId: x.githubId, login: x.login, name: null, avatarUrl: null, role: x.role, status: x.status }));
       const spaces = this.visible(m).map((s) => ({ id: s.id, kind: s.kind, name: s.name, canWrite: m.role !== "READER", seq: String(s.seq) }));
-      return send(200, { member: { githubId: m.githubId, login: m.login, name: null, avatarUrl: null, role: m.role, status: m.status }, team: { id: "team", name: "Team" }, members, spaces });
+      return send(200, { member: { githubId: m.githubId, login: m.login, name: null, avatarUrl: null, role: m.role, status: m.status }, team: { id: "team", name: "Team" }, members, spaces, webhooks: this.webhooks });
     }
     const route = /^\/spaces\/([^/]+)\/(entities|snapshot|ops)$/.exec(url.pathname);
     const s = route ? this.spaces.get(decodeURIComponent(route[1])) : undefined;

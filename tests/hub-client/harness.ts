@@ -47,10 +47,11 @@ export async function makeHubClient(hub: FakeHub, githubId: bigint, login: strin
     for (const s of await db.space.findMany({ where: { backend: "HUB" } })) await engine.syncSpace(s);
   };
   /** Starts the live link against the FakeHub (in-memory sockets); the engine's hubLive reads it. */
-  const startLive = (o: { timers?: Timers; random?: () => number; getToken?: () => Promise<string | null>; connect?: (url: string, protocols: string[]) => SocketLike } = {}) => {
+  const startLive = (o: { timers?: Timers; random?: () => number; getToken?: () => Promise<string | null>; connect?: (url: string, protocols: string[]) => SocketLike; notify?: () => void; refreshRepository?: (repositoryId: string) => Promise<void>; now?: () => number } = {}) => {
     liveHandle?.stop();
     liveHandle = startHubLive({
       db, engine, client, origin, getToken: o.getToken ?? (async () => token), timers: o.timers, random: o.random ?? (() => 0.5),
+      notify: o.notify, refreshRepository: o.refreshRepository, now: o.now,
       connect: o.connect ?? ((_url, protocols) => hub.socket(protocols.find((p) => p.startsWith("bearer."))?.slice(7) ?? "")),
     });
     return liveHandle;
