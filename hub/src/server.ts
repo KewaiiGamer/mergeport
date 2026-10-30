@@ -10,6 +10,8 @@ import { findSession, isBootstrapped, requestMembers } from "./auth";
 import { createLimiter, type Limiter } from "./ratelimit";
 import { entityRoutes, startPruneTimer } from "./entities";
 import { HttpError, json, matchRoute, route, type Route } from "./http";
+import { createWebhookState, type WebhookState } from "./settings";
+import { webhookRoutes } from "./webhook-routes";
 import { createLogger, type Logger } from "./log";
 
 export type { Logger };
@@ -23,6 +25,8 @@ export type HubContext = {
   publicUrl: () => string;
   notify: Notifier;
   limiter: Limiter;
+  /** GitHub App webhook secret and the last delivery. */
+  webhooks: WebhookState;
   /** Fresh per process. A database restored from a backup can only be served by a new process, so clients that see it change compare their state with the hub's. */
   epoch: string;
 };
@@ -39,6 +43,7 @@ export function coreRoutes(): Route<HubContext>[] {
     ...authRoutes(),
     ...adminRoutes(),
     ...entityRoutes(),
+    ...webhookRoutes(),
   ];
 }
 
@@ -53,6 +58,7 @@ export function createHub(opts: { config: HubConfig; db: HubDb; now?: () => numb
     log,
     publicUrl: () => opts.config.publicUrl || listened,
     limiter: createLimiter(now),
+    webhooks: createWebhookState(opts.db, opts.config.githubWebhookSecret),
     epoch: randomUUID(),
     notify: createNotifier({ db: opts.db, now, findSession, ...opts.ws, log }),
   };

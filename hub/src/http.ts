@@ -13,6 +13,21 @@ export function json(res: ServerResponse, status: number, body: unknown, headers
   res.end(text);
 }
 
+/** The whole body as a Buffer, untouched. Drains an oversized body so the 413 reaches the client. */
+export async function readRaw(req: IncomingMessage, limitBytes: number): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  let tooBig = false;
+  for await (const chunk of req) {
+    const buf = chunk as Buffer;
+    size += buf.length;
+    if (size > limitBytes) tooBig = true;
+    if (!tooBig) chunks.push(buf);
+  }
+  if (tooBig) throw new HttpError(413, "body too large", { connection: "close" });
+  return Buffer.concat(chunks);
+}
+
 export async function readJson<T>(req: IncomingMessage, schema: ZodType<T>, limitBytes = 1_000_000): Promise<T> {
   const chunks: Buffer[] = [];
   let size = 0;

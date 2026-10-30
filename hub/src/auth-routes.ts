@@ -100,7 +100,7 @@ export function authRoutes(): Route<HubContext>[] {
       const s = requireSession(ctx, req);
       const rows = ctx.db.prepare("SELECT * FROM member WHERE status = 'ACTIVE' ORDER BY joined_at, github_id").safeIntegers(true).all() as Parameters<typeof toMember>[0][];
       const self = getMember(ctx.db, s.githubId) ?? s.member;
-      json(res, 200, { member: memberJson(self), team: teamJson(ctx), members: rows.map((r) => memberJson(toMember(r))), spaces: listSpacesFor(ctx.db, self) });
+      json(res, 200, { member: memberJson(self), team: teamJson(ctx), members: rows.map((r) => memberJson(toMember(r))), spaces: listSpacesFor(ctx.db, self), webhooks: ctx.webhooks.status() });
     }),
   ];
 }

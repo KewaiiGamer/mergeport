@@ -11,6 +11,10 @@ export const WS_SILENCE_MS = 75_000;
 export const WS_COALESCE_MS = 100;
 /** After `bye`, how long a peer gets to answer the close handshake before the socket is cut. */
 const CLOSE_GRACE_MS = 1000;
+/** Client frames: a 2000-id watch message is about 40 KB. */
+const MAX_CLIENT_FRAME = 64 * 1024;
+/** Most repositories one connection may watch. */
+export const MAX_WATCH = 2000;
 const PROTOCOL = "mergeport.v1";
 const TOKEN = /^[A-Za-z0-9_-]{1,200}$/;
 
@@ -33,6 +37,8 @@ export type Notifier = {
   changed(spaceId: string, seq: bigint): void;
   /** `target` is one member's github id, or `"space:" + spaceId` for everyone who can read that space now. */
   access(target: bigint | `space:${string}`, spaceId: string, action: AccessAction): void;
+  /** Relays a GitHub webhook delivery to the connections that watch the repository and may see it; returns how many were sent. */
+  github(relay: GithubRelay): number;
   team(reason: "member" | "role"): void;
   /** Sends `bye` and closes with 4403. */
   kick(githubId: bigint, reason: "removed"): void;
@@ -42,7 +48,9 @@ export type Notifier = {
   shutdown(): Promise<void>;
 };
 
-type Conn = { ws: WebSocket; token: string; idHash: string; githubId: bigint; silence: NodeJS.Timeout | null; grace: NodeJS.Timeout | null };
+export type GithubRelay = { repoId: string; isPrivate: boolean; ownerLogin: string; event: string; delivery: string; payload: unknown };
+
+type Conn = { watch: Set<string>; ws: WebSocket; token: string; idHash: string; githubId: bigint; silence: NodeJS.Timeout | null; grace: NodeJS.Timeout | null };
 
 const reject = (socket: Duplex, status: number, text: string) => {
   const body = `HTTP/1.1 ${status} ${text}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`;
@@ -64,7 +72,7 @@ export function createNotifier(deps: NotifierDeps): Notifier {
   const coalesceMs = deps.coalesceMs ?? WS_COALESCE_MS;
   const conns = new Set<Conn>();
   const pending = new Map<string, { seq: bigint; timer: NodeJS.Timeout }>();
-  const wss = new WebSocketServer({ noServer: true, maxPayload: 4096, handleProtocols: () => PROTOCOL });
+  const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_CLIENT_FRAME, handleProtocols: () => PROTOCOL });
   const detach: (() => void)[] = [];
   let closing = false;
 
@@ -132,11 +140,11 @@ export function createNotifier(deps: NotifierDeps): Notifier {
       // why, and close as kick() does, so the client learns it was removed instead of reconnecting forever.
       return wss.handleUpgrade(req, socket, head, (ws) => {
         ws.on("error", () => ws.terminate());
-        closeConn({ ws, token, idHash: session.idHash, githubId: member.githubId, silence: null, grace: null }, CLOSE_REMOVED, "removed");
+        closeConn({ ws, token, idHash: session.idHash, githubId: member.githubId, silence: null, grace: null, watch: new Set() }, CLOSE_REMOVED, "removed");
       });
     }
     wss.handleUpgrade(req, socket, head, (ws) => {
-      const c: Conn = { ws, token, idHash: session.idHash, githubId: member.githubId, silence: null, grace: null };
+      const c: Conn = { ws, token, idHash: session.idHash, githubId: member.githubId, silence: null, grace: null, watch: new Set() };
       conns.add(c);
       armSilence(c);
       deps.log?.info("ws open", { member: member.githubId.toString(), sockets: conns.size });
@@ -152,8 +160,13 @@ export function createNotifier(deps: NotifierDeps): Notifier {
         const m = authenticate(c, true);
         if (!m || isBinary) return;
         try {
-          const msg = JSON.parse(raw.toString()) as { t?: unknown };
+          const msg = JSON.parse(raw.toString()) as { t?: unknown } | null;
+          if (!msg || typeof msg !== "object") return;
           if (msg.t === "ping") send(c, { t: "pong" });
+          else if (msg.t === "watch") {
+            const repos = (msg as { repos?: unknown }).repos;
+            if (Array.isArray(repos)) c.watch = new Set(repos.filter((r): r is string => typeof r === "string" && /^[0-9]{1,19}$/.test(r)).slice(0, MAX_WATCH));
+          }
         } catch {
           /* ignore garbage */
         }
@@ -187,6 +200,27 @@ export function createNotifier(deps: NotifierDeps): Notifier {
         }
         send(c, { t: "access", spaceId, action });
       }
+    },
+    github(r) {
+      const watchers = [...conns].filter((c) => c.watch.has(r.repoId));
+      if (watchers.length === 0) return 0;
+      const text = JSON.stringify({ t: "gh", repoId: r.repoId, event: r.event, delivery: r.delivery, payload: r.payload });
+      let sharedIn: string[] | null = null;
+      let sent = 0;
+      for (const c of watchers) {
+        const m = authenticate(c);
+        if (!m) continue;
+        let allowed = !r.isPrivate || m.login.toLowerCase() === r.ownerLogin.toLowerCase();
+        if (!allowed) {
+          sharedIn ??= (deps.db.prepare("SELECT DISTINCT space_id FROM entity WHERE type = 'repo' AND deleted = 0 AND CAST(json_extract(data, '$.githubId') AS TEXT) = ?").all(r.repoId) as { space_id: string }[]).map((x) => x.space_id);
+          allowed = sharedIn.some((id) => spaceAccess(deps.db, m, id).canRead);
+        }
+        if (allowed && c.ws.readyState === c.ws.OPEN) {
+          c.ws.send(text);
+          sent++;
+        }
+      }
+      return sent;
     },
     team(reason) {
       for (const c of conns) send(c, { t: "team", reason });

@@ -3,7 +3,7 @@ import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { randomBytes } from "node:crypto";
+import { createHmac, randomBytes } from "node:crypto";
 import type { HubConfig } from "../../hub/src/config";
 import { openHubDb, type HubDb } from "../../hub/src/db";
 import { createLogger } from "../../hub/src/log";
@@ -134,7 +134,7 @@ export type TestHub = {
   api(token?: string): (method: string, path: string, body?: unknown) => Promise<ApiResult>;
 };
 
-export async function startTestHub(o: { now?: () => number; dataDir?: string; /** Fixed port (a hub restarted on the address its clients already know). */ port?: number; trustProxy?: boolean; /** Login allowed to bootstrap the empty hub; default `olive`. */ ownerLogin?: string; ws?: { silenceMs?: number; coalesceMs?: number } } = {}): Promise<TestHub> {
+export async function startTestHub(o: { now?: () => number; dataDir?: string; /** Fixed port (a hub restarted on the address its clients already know). */ port?: number; trustProxy?: boolean; /** Login allowed to bootstrap the empty hub; default `olive`. */ ownerLogin?: string; ws?: { silenceMs?: number; coalesceMs?: number }; /** MERGEPORT_HUB_GITHUB_WEBHOOK_SECRET fallback. */ webhookSecretEnv?: string } = {}): Promise<TestHub> {
   const github = new FakeGitHubOAuth();
   await github.start();
   const dataDir = o.dataDir ?? mkdtempSync(path.join(tmpdir(), "hub-"));
@@ -149,6 +149,7 @@ export async function startTestHub(o: { now?: () => number; dataDir?: string; /*
     githubApiBase: github.url,
     githubOauthBase: github.url,
     bindHost: "127.0.0.1",
+    githubWebhookSecret: o.webhookSecretEnv,
   };
   const db = openHubDb(dataDir);
   const logs: string[] = [];
@@ -182,6 +183,36 @@ export async function startTestHub(o: { now?: () => number; dataDir?: string; /*
       };
     },
   };
+}
+
+/** X-Hub-Signature-256 value for a body, as GitHub computes it. */
+export const signBody = (secret: string, body: string | Buffer): string => `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`;
+
+let deliverySeq = 0;
+/** A repository object as GitHub puts it in every webhook payload. */
+export const ghRepo = (id: number, owner: string, isPrivate = false) => ({ id, private: isPrivate, owner: { login: owner }, full_name: `${owner}/repo${id}` });
+
+/** Posts a delivery to /webhooks/github, signed with `secret` unless `signature` overrides it (null sends none). `payload` may be a ready string. */
+export async function deliver(
+  hub: TestHub,
+  secret: string,
+  event: string,
+  payload: unknown,
+  o: { delivery?: string; signature?: string | null; headers?: Record<string, string> } = {},
+): Promise<ApiResult> {
+  const body = typeof payload === "string" ? payload : JSON.stringify(payload);
+  const headers: Record<string, string> = { "content-type": "application/json", "x-github-event": event, "x-github-delivery": o.delivery ?? `d-${++deliverySeq}`, ...o.headers };
+  const sig = o.signature === undefined ? signBody(secret, body) : o.signature;
+  if (sig !== null) headers["x-hub-signature-256"] = sig;
+  const r = await fetch(hub.url + "/webhooks/github", { method: "POST", headers, body });
+  const text = await r.text();
+  let parsed: any = text;
+  try {
+    parsed = text ? JSON.parse(text) : null;
+  } catch {
+    /* keep text */
+  }
+  return { status: r.status, body: parsed, headers: r.headers };
 }
 
 /** Adds the fake GitHub user (if absent) and completes a device-flow sign-in; returns the session token. */
