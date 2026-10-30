@@ -15,9 +15,17 @@ export function normalizeHubOrigin(input: string): string {
   return u.origin;
 }
 
-async function send(fetchImpl: typeof fetch, url: string, init: RequestInit): Promise<Response> {
+/**
+ * Every hub request has a deadline. Without one a connection that went quiet (a proxy dropped it after a hub restart, a laptop woke
+ * up on another network) leaves its sync cycle waiting forever, and every later automatic sync of that space waits behind it.
+ * The signal also covers reading the body.
+ */
+export const HUB_REQUEST_TIMEOUT_MS = 20_000;
+export const HUB_BULK_TIMEOUT_MS = 60_000; // snapshot and push can carry a lot
+
+async function send(fetchImpl: typeof fetch, url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
   try {
-    return await fetchImpl(url, init);
+    return await fetchImpl(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
   } catch (e) {
     throw new HubError("network", e instanceof Error ? e.message : "network error");
   }
@@ -45,16 +53,16 @@ async function json<T>(res: Response): Promise<T> {
 
 export class HttpHubClient implements HubClient {
   private readonly origin: string;
-  constructor(origin: string, private getToken: () => Promise<string | null>, private fetchImpl: typeof fetch = (...a) => fetch(...a)) {
+  constructor(origin: string, private getToken: () => Promise<string | null>, private fetchImpl: typeof fetch = (...a) => fetch(...a), private timeouts: { request?: number; bulk?: number } = {}) {
     this.origin = normalizeHubOrigin(origin);
   }
 
-  private async call(path: string, init: RequestInit = {}, allow410 = false): Promise<Response | "gone" | "history"> {
+  private async call(path: string, init: RequestInit = {}, allow410 = false, bulk = false): Promise<Response | "gone" | "history"> {
     const token = await this.getToken();
     if (!token) throw new HubError("auth", "Not signed in");
     const headers: Record<string, string> = { authorization: `Bearer ${token}`, accept: "application/json" };
     if (init.body) headers["content-type"] = "application/json";
-    const res = await send(this.fetchImpl, this.origin + path, { ...init, headers, redirect: "error" });
+    const res = await send(this.fetchImpl, this.origin + path, { ...init, headers, redirect: "error" }, bulk ? (this.timeouts.bulk ?? HUB_BULK_TIMEOUT_MS) : (this.timeouts.request ?? HUB_REQUEST_TIMEOUT_MS));
     if (res.status === 410 && allow410) {
       const b = (await res.json().catch(() => null)) as { reason?: string } | null;
       return b?.reason === "history" ? "history" : "gone";
@@ -76,12 +84,12 @@ export class HttpHubClient implements HubClient {
   }
 
   async snapshot(spaceId: string) {
-    const b = await json<{ epoch?: string; seq: string; seqOp?: string; entities: EntityFile[] }>((await this.call(`/spaces/${encodeURIComponent(spaceId)}/snapshot`)) as Response);
+    const b = await json<{ epoch?: string; seq: string; seqOp?: string; entities: EntityFile[] }>((await this.call(`/spaces/${encodeURIComponent(spaceId)}/snapshot`, {}, false, true)) as Response);
     return { epoch: b.epoch, seq: BigInt(b.seq), seqOp: b.seqOp, entities: b.entities };
   }
 
   async push(spaceId: string, ops: Op[]) {
-    const res = (await this.call(`/spaces/${encodeURIComponent(spaceId)}/ops`, { method: "POST", body: JSON.stringify({ ops }) })) as Response;
+    const res = (await this.call(`/spaces/${encodeURIComponent(spaceId)}/ops`, { method: "POST", body: JSON.stringify({ ops }) }, false, true)) as Response;
     const b = await json<{ results: OpResult[]; seq: string }>(res);
     return { results: b.results, seq: BigInt(b.seq) };
   }
@@ -89,7 +97,7 @@ export class HttpHubClient implements HubClient {
 
 export async function checkHubHealth(origin: string, supportedSchema = 1, fetchImpl: typeof fetch = (...a) => fetch(...a)): Promise<{ teamName: string | null; publicUrl: string; githubHost: string }> {
   const typed = normalizeHubOrigin(origin);
-  const res = await send(fetchImpl, typed + "/health", { headers: { accept: "application/json" }, redirect: "error" });
+  const res = await send(fetchImpl, typed + "/health", { headers: { accept: "application/json" }, redirect: "error" }, HUB_REQUEST_TIMEOUT_MS);
   if (!res.ok) throw failure(res);
   const h = await json<{ team?: { name: string } | null; schema?: number; publicUrl?: string; githubHost?: string }>(res);
   if (typeof h.schema !== "number") throw new HubError("unknown", "Not a Mergeport hub");

@@ -19,6 +19,36 @@ describe("normalizeHubOrigin", () => {
 
 const op = (opId: string, baseVersion: number, data: Record<string, unknown> = { title: "a" }): Op => ({ opId, type: "task", entityId: "t1", kind: "UPSERT", baseVersion, data });
 
+describe("request deadline", () => {
+  /** A fetch that never answers on its own and only ends when its signal aborts, like a connection a proxy silently dropped. */
+  const hung = ((_url: unknown, init?: RequestInit) =>
+    new Promise<Response>((_ok, fail) => {
+      init?.signal?.addEventListener("abort", () => fail(init.signal!.reason));
+    })) as unknown as typeof fetch;
+
+  it("a hung pull fails as a network error after the deadline instead of waiting forever", async () => {
+    const client = new HttpHubClient("http://127.0.0.1:1", async () => "t", hung, { request: 80 });
+    const t0 = Date.now();
+    await expect(client.pull("common", 0n)).rejects.toMatchObject({ kind: "network" });
+    expect(Date.now() - t0).toBeLessThan(2000);
+  });
+
+  it("push and snapshot use the longer bulk deadline, me() the short one", async () => {
+    const client = new HttpHubClient("http://127.0.0.1:1", async () => "t", hung, { request: 60, bulk: 400 });
+    const timed = async (f: () => Promise<unknown>) => {
+      const t0 = Date.now();
+      await expect(f()).rejects.toMatchObject({ kind: "network" });
+      return Date.now() - t0;
+    };
+    const quick = await timed(() => client.me());
+    const slow = await timed(() => client.push("common", [op("o1", 0)]));
+    const slowSnap = await timed(() => client.snapshot("common"));
+    expect(quick).toBeLessThan(300);
+    expect(slow).toBeGreaterThanOrEqual(350);
+    expect(slowSnap).toBeGreaterThanOrEqual(350);
+  });
+});
+
 describe("redirects", () => {
   it("a 302 is a HubError and the bearer is never replayed", async () => {
     const seen: string[] = [];

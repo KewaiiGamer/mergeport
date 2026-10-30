@@ -60,6 +60,15 @@ describe("runtime engine per backend", () => {
     expect(status.pendingOps).toBe(0);
   });
 
+  it("concurrent first callers share one engine, so the live link and the pages drive the same one", async () => {
+    await db.teamConfig.upsert({ where: { id: "team" }, create: { id: "team", mode: "TEAM", backend: "HUB", hubOrigin: ORIGIN }, update: { mode: "TEAM", backend: "HUB", hubOrigin: ORIGIN } });
+    await hubSessionPort.save(resolveDbFile(), { origin: ORIGIN, token: TOKEN, githubId: "4242", login: "runtime-user" });
+    const engines = await Promise.all([getEngine(), getEngine(), getEngine(), getEngine()]);
+    expect(engines[0]).not.toBeNull();
+    for (const e of engines) expect(e).toBe(engines[0]);
+    expect(await getEngine()).toBe(engines[0]);
+  });
+
   it("a GitHub profile keeps the GitHub store and has no hub client", async () => {
     await db.teamConfig.upsert({ where: { id: "team" }, create: { id: "team", mode: "TEAM", backend: "GITHUB" }, update: { mode: "TEAM", backend: "GITHUB", hubOrigin: null } });
     const space = await hubSpace();

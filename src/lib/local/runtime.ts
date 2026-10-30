@@ -24,7 +24,7 @@ import { env } from "@/lib/env";
  */
 
 type HubLive = ReturnType<typeof startHubLive>;
-type G = typeof globalThis & { __mp?: { bus: EventEmitter; engine?: SyncEngine; team?: TeamService; hub?: { key: string; svc: HubTeamService }; live?: HubLive; version: number } };
+type G = typeof globalThis & { __mp?: { bus: EventEmitter; engine?: SyncEngine; enginePromise?: Promise<SyncEngine | null>; team?: TeamService; hub?: { key: string; svc: HubTeamService }; live?: HubLive; version: number } };
 const g = globalThis as G;
 const state = (g.__mp ??= { bus: new EventEmitter(), version: 0 });
 state.bus.setMaxListeners(50);
@@ -69,6 +69,22 @@ const hubToken = async (): Promise<string | null> => (await loadHubSession(db, o
 export async function getEngine(): Promise<SyncEngine | null> {
   if (isDemo()) return null;
   if (state.engine) return state.engine;
+  // Concurrent first callers (the scheduler's first tick and a page render) share one build. Two engines would each keep their own
+  // "cycle in progress" set, and the live link would drive a different engine than the pages and the Sync button use.
+  const building = (state.enginePromise ??= buildEngine().then(
+    (e) => {
+      if (!e) state.enginePromise = undefined; // no signed-in account yet: ask again next time
+      return e;
+    },
+    (err) => {
+      state.enginePromise = undefined;
+      throw err;
+    },
+  ));
+  return building;
+}
+
+async function buildEngine(): Promise<SyncEngine | null> {
   const actor = await localActor();
   if (!actor) return null;
   const f = ghFetch(profileRunner(db));
@@ -143,6 +159,7 @@ export const resetRuntime = () => {
   state.live = undefined;
   registerHubLinkState(null);
   state.engine = undefined;
+  state.enginePromise = undefined;
   state.team = undefined;
   state.hub = undefined;
 };
