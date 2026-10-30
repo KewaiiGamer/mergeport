@@ -22,6 +22,8 @@ export type FakeHubOpts = {
   spaces?: { id: string; kind: "COMMON" | "RESTRICTED"; name: string; canWrite: boolean; seq: string }[];
   /** Members of each space, answered by GET /admin/spaces. */
   spaceMembers?: Record<string, { githubId: string; canWrite: boolean }[]>;
+  /** What GET /me answers under `webhooks` (default: not set up). */
+  webhooks?: { enabled: boolean; appSlug: string | null; lastDeliveryAt: string | null; lastEvent: string | null };
   /** Answer every authenticated request with this status (e.g. 401, 403, 429). */
   forceStatus?: number;
 };
@@ -75,7 +77,7 @@ export async function startFakeHub(opts: FakeHubOpts = {}) {
       const actor = members.find((m) => m.githubId === (opts.githubId ?? "1"));
       if (!actor || actor.status === "REMOVED") return send(res, 403);
       if (req.method === "POST" && p === "/auth/logout") return send(res, 204);
-      if (req.method === "GET" && p === "/me") return send(res, 200, { member: full(actor), team: { name: team ?? "" }, members: members.map(full), spaces });
+      if (req.method === "GET" && p === "/me") return send(res, 200, { member: full(actor), team: { name: team ?? "" }, members: members.map(full), spaces, webhooks: opts.webhooks ?? { enabled: false, appSlug: null, lastDeliveryAt: null, lastEvent: null } });
       // admin routes: ADMIN or OWNER; only the OWNER touches an ADMIN; the OWNER is untouchable
       if (actor.role !== "OWNER" && actor.role !== "ADMIN") return send(res, 403);
       const b = (body ?? {}) as { githubLogin?: string; role?: FakeMember["role"]; name?: string };

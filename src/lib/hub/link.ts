@@ -35,6 +35,8 @@ export type HubLinkOptions = {
   onAccess(spaceId: string, action: "added" | "removed" | "deleted"): void;
   onTeam(reason: "member" | "role"): void;
   onHello?(spaces: { id: string; seq: bigint }[]): void;
+  /** A GitHub webhook delivery relayed by the hub. `payload` is null when the hub did not send it (too large). */
+  onGithubEvent?(e: { repoId: string; event: string; delivery: string; payload: unknown | null }): void;
   onState?(s: HubLinkState): void;
 };
 
@@ -54,6 +56,7 @@ export class HubLink {
   private failures = 0;
   private retry: unknown = null;
   private ping: unknown = null;
+  private helloed = false;
   private debounce = new Map<string, { seq: bigint; timer: unknown }>();
   private readonly timers: Timers;
   private readonly random: () => number;
@@ -80,6 +83,22 @@ export class HubLink {
     this.clearTimers();
     this.dropSocket();
     this._state = "offline";
+  }
+
+  /** True once the current socket has received `hello` (cleared on close): `watch` sends only then. After every `hello` the owner sends its set again. */
+  get isOpen(): boolean {
+    return this.sock !== null && this.helloed;
+  }
+
+  /** Replaces the set of GitHub repositories (decimal ids) this connection wants relays for. Nothing is sent while the socket is closed. */
+  watch(repoIds: string[]): void {
+    const s = this.sock;
+    if (!s || !this.helloed) return;
+    try {
+      s.send(JSON.stringify({ t: "watch", repos: repoIds }));
+    } catch {
+      // a dead socket reports itself through onclose; the next hello sends the set again
+    }
   }
 
   private setState(s: HubLinkState) {
@@ -115,6 +134,7 @@ export class HubLink {
       return;
     }
     this.sock = s;
+    this.helloed = false;
     s.onopen = () => {
       if (this.sock !== s) return;
       this.ping = this.timers.setInterval(() => {
@@ -132,6 +152,7 @@ export class HubLink {
     s.onclose = (e) => {
       if (this.sock !== s) return;
       this.sock = null;
+      this.helloed = false;
       this.closed(e.code);
     };
   }
@@ -153,6 +174,7 @@ export class HubLink {
   private dispatch(m: { t?: string; [k: string]: unknown }) {
     switch (m.t) {
       case "hello": {
+        this.helloed = true;
         this.failures = 0;
         this.setState("live");
         const spaces = Array.isArray(m.spaces) ? (m.spaces as { id: string; seq: string | number }[]).map((s) => ({ id: String(s.id), seq: BigInt(s.seq) })) : [];
@@ -162,6 +184,12 @@ export class HubLink {
       case "changed":
         this.changed(String(m.spaceId), BigInt(m.seq as string | number));
         break;
+      case "gh": {
+        const { repoId, event, delivery } = m;
+        if (typeof repoId !== "string" || typeof event !== "string" || typeof delivery !== "string") break;
+        this.o.onGithubEvent?.({ repoId, event, delivery, payload: m.payload === undefined ? null : m.payload });
+        break;
+      }
       case "access":
         this.o.onAccess(String(m.spaceId), m.action as "added" | "removed" | "deleted");
         break;
@@ -219,6 +247,7 @@ export class HubLink {
   private dropSocket() {
     const s = this.sock;
     this.sock = null;
+    this.helloed = false;
     this.clearPing();
     if (!s) return;
     s.onopen = s.onmessage = s.onclose = s.onerror = null;

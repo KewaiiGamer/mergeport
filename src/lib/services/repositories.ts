@@ -1,4 +1,5 @@
 import type { Prisma } from "@/generated/prisma/client";
+import { refreshHubWatch } from "@/lib/hub/watch";
 import type { Db } from "@/lib/db";
 import { NotFoundError, ValidationError } from "@/lib/errors";
 import { requireRepo, type Viewer } from "@/lib/authz/viewer";
@@ -72,6 +73,7 @@ export async function trackLocally(db: Db, v: Viewer, metas: RepoMeta[]) {
     out.push(r);
   }
   await audit(db, v, "repository.track", undefined, { githubIds: metas.map((m) => m.githubId.toString()) });
+  refreshHubWatch();
   return out;
 }
 
@@ -93,6 +95,7 @@ export async function removeFromTracking(db: Db, v: Viewer, repositoryId: string
     db.worktreeSnapshot.deleteMany({ where: { repositoryId: repo.id } }),
   ]);
   await audit(db, v, "repository.untrack", { type: "Repository", id: repositoryId });
+  refreshHubWatch();
 }
 
 /**

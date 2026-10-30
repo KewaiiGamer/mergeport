@@ -38,6 +38,8 @@ export const handlers: Record<string, Handler> = {
     } finally {
       await recordRate(port.lastRate());
     }
+    // The data of this repository changed: redraw the open pages (also right for the Refresh button).
+    (await import("@/lib/local/runtime")).notifyChange("pulled");
     const maps = await db.forkMapping.findMany({ where: { OR: [{ forkRepoId: p.repositoryId }, { upstreamRepoId: p.repositoryId }] }, select: { id: true } });
     const { enqueue } = await import("@/lib/jobs");
     for (const m of maps) await enqueue(db, { type: "sync.fork", payload: { mappingId: m.id }, dedupeKey: `fork:${m.id}` });

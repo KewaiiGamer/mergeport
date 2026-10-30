@@ -51,6 +51,24 @@ export async function tickOnce(now = Date.now()): Promise<{ coordination: number
   return out;
 }
 
+/**
+ * Runs the due jobs now instead of at the next 5 s tick (a webhook-triggered refresh should not wait for it). It uses the
+ * scheduler's own `busy` flag, so it never runs beside a tick: if one is running, that tick's drain (or the next tick) picks
+ * the job up. A no-op when the scheduler was not started in this process.
+ */
+export async function runJobsNow(): Promise<void> {
+  const s = g.__mpScheduler;
+  if (!s || s.busy || isDemo()) return;
+  s.busy = true;
+  try {
+    await drainJobs();
+  } catch (e) {
+    console.error("job run failed", e instanceof Error ? e.message : e);
+  } finally {
+    s.busy = false;
+  }
+}
+
 export function startLocalScheduler(intervalMs = 5000) {
   if (g.__mpScheduler) return;
   void recoverDiscovery().catch(() => {}); // an attempt a crash interrupted must not stay "retrying" for ever
