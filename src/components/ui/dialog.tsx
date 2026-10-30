@@ -1,16 +1,21 @@
 "use client";
 
 import * as D from "@radix-ui/react-dialog";
-import type { ReactNode } from "react";
+import { createContext, useContext, useState, type ReactNode } from "react";
 import { X } from "./icons";
+
+const SheetCloseContext = createContext<(() => void) | null>(null);
+/** Closes the Sheet this component is rendered in; null outside a Sheet. A form uses it to close the dialog once its action succeeded. */
+export const useSheetClose = () => useContext(SheetCloseContext);
 
 /**
  * Accessible modal: named, focus-trapped, focus restored to the trigger on close, Escape closes.
  * CSS owns the open/close motion (opacity + transform); nothing waits on it before the user can act.
  */
 export function Sheet({ trigger, title, description, children, side = "center" }: { trigger: ReactNode; title: string; description?: string; children: ReactNode; side?: "center" | "right" }) {
+  const [open, setOpen] = useState(false);
   return (
-    <D.Root>
+    <D.Root open={open} onOpenChange={setOpen}>
       <D.Trigger asChild>{trigger}</D.Trigger>
       <D.Portal>
         <D.Overlay className="scrim fixed inset-0 z-40 bg-scrim" />
@@ -30,7 +35,7 @@ export function Sheet({ trigger, title, description, children, side = "center" }
               <X size={16} aria-hidden />
             </D.Close>
           </div>
-          {children}
+          <SheetCloseContext.Provider value={() => setOpen(false)}>{children}</SheetCloseContext.Provider>
         </D.Content>
       </D.Portal>
     </D.Root>

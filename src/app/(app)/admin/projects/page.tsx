@@ -23,6 +23,7 @@ export default async function Projects() {
     db.repository.findMany({ where: { workspaceId: viewer.workspaceId, trackingStatus: { not: "REMOVED" } }, select: { id: true, fullName: true }, orderBy: { fullName: "asc" } }),
     db.member.findMany({ where: { workspaceId: viewer.workspaceId, status: "ACTIVE", role: "MEMBER" }, include: { user: true } }),
   ]);
+  const canShareWithTeam = spaces.some((s) => s.kind === "COMMON");
   const me = viewer.login;
   const projects = [...projectsRaw].sort((x, y) => byPersonalFirst(me)(x.name, y.name));
   const repos = [...reposRaw].sort((x, y) => byOwnerFirst(me)(x.fullName, y.fullName));
@@ -34,8 +35,8 @@ export default async function Projects() {
         subtitle="A project groups repositories and people for planning. Project membership never grants repository access, and a GitHub organization is not a project."
         actions={
           <Sheet title="New project" trigger={<button className="btn btn-primary"><Plus size={14} aria-hidden /> New project</button>}>
-            <ActionForm action={createProjectAction} submitLabel="Create project">
-              <div className="flex flex-col gap-3"><div><label className="label" htmlFor="p-name">Name</label><input id="p-name" name="name" className="input" required /></div><div><label className="label" htmlFor="p-rev">Required reviewers (optional)</label><input id="p-rev" name="reviewers" className="input" placeholder="GitHubLogin, org/team-slug" /></div><div><label className="label" htmlFor="p-desc">Description</label><input id="p-desc" name="description" className="input" /></div></div>
+            <ActionForm action={createProjectAction} submitLabel="Create project" closeOnSuccess>
+              <div className="flex flex-col gap-3"><div><label className="label" htmlFor="p-name">Name</label><input id="p-name" name="name" className="input" required /></div><div><label className="label" htmlFor="p-rev">Required reviewers (optional)</label><input id="p-rev" name="reviewers" className="input" placeholder="GitHubLogin, org/team-slug" /></div><div><label className="label" htmlFor="p-desc">Description</label><input id="p-desc" name="description" className="input" /></div>{canShareWithTeam && <fieldset><legend className="label">Sharing</legend><label className="flex items-center gap-2 text-[13px]"><input type="checkbox" name="share" value="1" />Share with everyone in the team</label><p className="mt-1 text-[12px] text-ink-3">Leave it off to keep the project on this computer. You can change it later under the project&apos;s Sharing section.</p></fieldset>}</div>
             </ActionForm>
           </Sheet>
         }
