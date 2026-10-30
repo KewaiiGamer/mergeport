@@ -26,7 +26,10 @@ export type FakeHubOpts = {
   webhooks?: { enabled: boolean; appSlug: string | null; lastDeliveryAt: string | null; lastEvent: string | null };
   /** Answer every authenticated request with this status (e.g. 401, 403, 429). */
   forceStatus?: number;
+  /** Starts with a webhook secret stored (as if the owner had set it up); `lastDeliveryAt`/`lastEvent` are answered by /me. */
+  webhook?: { secret?: string; appSlug?: string | null; lastDeliveryAt?: string | null; lastEvent?: string | null };
 };
+export const FAKE_WEBHOOK_SECRET = "s".repeat(40);
 export type FakeMember = { githubId: string; login: string; name?: string | null; avatarUrl?: string | null; role: "OWNER" | "ADMIN" | "MEMBER" | "READER"; status?: "INVITED" | "ACTIVE" | "REMOVED" };
 export const FAKE_SESSION = "session-token-secret";
 export const FAKE_DEVICE_CODE = "dev-code-secret";
@@ -40,6 +43,8 @@ export async function startFakeHub(opts: FakeHubOpts = {}) {
   const members: FakeMember[] = opts.members ?? [{ githubId: opts.githubId ?? "1", login: opts.login ?? "octocat", role: "OWNER" }];
   const spaces = opts.spaces ?? [{ id: "common", kind: "COMMON", name: "Common", canWrite: true, seq: "0" }];
   const full = (m: FakeMember) => ({ githubId: m.githubId, login: m.login, name: m.name ?? null, avatarUrl: m.avatarUrl ?? null, role: m.role, status: m.status ?? "ACTIVE" });
+  // The hub's `setting` rows for the GitHub webhook (PUT/DELETE /admin/github-webhook, OWNER only); /me reports them without the secret.
+  const webhook = { secret: opts.webhook?.secret ?? null, appSlug: opts.webhook?.appSlug ?? null, lastDeliveryAt: opts.webhook?.lastDeliveryAt ?? null, lastEvent: opts.webhook?.lastEvent ?? null };
   const team = opts.team === undefined ? "Fake Team" : opts.team;
   const send = (res: http.ServerResponse, status: number, body?: unknown) => {
     res.writeHead(status, { "content-type": "application/json" });
@@ -77,7 +82,23 @@ export async function startFakeHub(opts: FakeHubOpts = {}) {
       const actor = members.find((m) => m.githubId === (opts.githubId ?? "1"));
       if (!actor || actor.status === "REMOVED") return send(res, 403);
       if (req.method === "POST" && p === "/auth/logout") return send(res, 204);
-      if (req.method === "GET" && p === "/me") return send(res, 200, { member: full(actor), team: { name: team ?? "" }, members: members.map(full), spaces, webhooks: opts.webhooks ?? { enabled: false, appSlug: null, lastDeliveryAt: null, lastEvent: null } });
+      if (req.method === "GET" && p === "/me") return send(res, 200, { member: full(actor), team: { name: team ?? "" }, members: members.map(full), spaces, webhooks: opts.webhooks ?? { enabled: webhook.secret !== null, appSlug: webhook.appSlug, lastDeliveryAt: webhook.lastDeliveryAt, lastEvent: webhook.lastEvent } });
+      if (p === "/admin/github-webhook") {
+        if (actor.role !== "OWNER") return send(res, 403);
+        if (req.method === "PUT") {
+          const w = (body ?? {}) as { secret?: unknown; appSlug?: unknown };
+          if (typeof w.secret !== "string" || w.secret.length < 32 || w.secret.length > 256) return send(res, 400);
+          if (w.appSlug !== undefined && (typeof w.appSlug !== "string" || !/^[A-Za-z0-9-]{1,100}$/.test(w.appSlug))) return send(res, 400);
+          webhook.secret = w.secret;
+          webhook.appSlug = (w.appSlug as string | undefined) ?? null;
+          return send(res, 204);
+        }
+        if (req.method === "DELETE") {
+          webhook.secret = null;
+          webhook.appSlug = null;
+          return send(res, 204);
+        }
+      }
       // admin routes: ADMIN or OWNER; only the OWNER touches an ADMIN; the OWNER is untouchable
       if (actor.role !== "OWNER" && actor.role !== "ADMIN") return send(res, 403);
       const b = (body ?? {}) as { githubLogin?: string; role?: FakeMember["role"]; name?: string };
@@ -122,6 +143,8 @@ export async function startFakeHub(opts: FakeHubOpts = {}) {
     origin,
     requests,
     members,
+    /** The stored webhook secret and slug (what the hub's `setting` table would hold). */
+    webhook,
     stop: () =>
       new Promise<void>((r) => {
         server.closeAllConnections();

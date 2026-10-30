@@ -72,4 +72,5 @@ export {
   Users,
   WifiOff,
   X,
+  Zap,
 } from "lucide-react";

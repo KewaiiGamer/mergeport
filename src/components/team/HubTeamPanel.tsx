@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import Link from "next/link";
 import { ActionForm } from "@/components/forms/ActionForm";
 import { Select } from "@/components/ui/Select";
@@ -62,7 +63,7 @@ const ROLE_OPTIONS = (
 );
 
 /** Presentational: everything it shows was already decided by the page. Writes go through server actions, which the hub re-checks. */
-export function HubTeamPanel({ origin, status, overview, error, spaceMembers = null, removedMembers = [] }: { origin: string | null; status: HubLinkStatus; overview: HubOverview | null; error: HubTeamError | null; spaceMembers?: HubAdminSpace[] | null; removedMembers?: HubMember[] }) {
+export function HubTeamPanel({ origin, status, overview, error, spaceMembers = null, removedMembers = [], instantUpdates = null }: { origin: string | null; status: HubLinkStatus; overview: HubOverview | null; error: HubTeamError | null; spaceMembers?: HubAdminSpace[] | null; removedMembers?: HubMember[]; instantUpdates?: ReactNode }) {
   const removed = error?.kind === "forbidden";
   const needsSignIn = (status.needsSignIn || error?.kind === "unauthorized") && !removed;
   const o = removed ? null : overview;
@@ -87,6 +88,7 @@ export function HubTeamPanel({ origin, status, overview, error, spaceMembers = n
 
       {o && (
         <div className="flex flex-col gap-5">
+          {instantUpdates}
           <Panel title={`Members (${members.length})`} icon={Users} id="members">
             <ul>
               {members.map((m) => {

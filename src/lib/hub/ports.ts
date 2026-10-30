@@ -23,9 +23,12 @@ export type HubSpaceInfo = { id: string; kind: "COMMON" | "RESTRICTED"; name: st
 export type HubSpaceMember = { githubId: string; canWrite: boolean };
 export type HubAdminSpace = { id: string; kind: "COMMON" | "RESTRICTED"; name: string; members: HubSpaceMember[] };
 
+/** `/me.webhooks`: whether the hub holds a GitHub App webhook secret, and what it last received (event name only, never content). */
+export type HubWebhooks = { enabled: boolean; appSlug: string | null; lastDeliveryAt: string | null; lastEvent: string | null };
+
 /** Admin calls against the hub. The hub decides who may do what; callers only get friendlier errors. */
 export type HubAdminApi = {
-  me(): Promise<{ member: HubMember; team: { name: string }; members: HubMember[]; spaces: HubSpaceInfo[] }>;
+  me(): Promise<{ member: HubMember; team: { name: string }; members: HubMember[]; spaces: HubSpaceInfo[]; webhooks: HubWebhooks }>;
   invite(login: string, role: "ADMIN" | "MEMBER" | "READER"): Promise<void>;
   removeMember(githubId: string): Promise<void>;
   /** OWNER only: removed members, who /me no longer lists. */
@@ -38,6 +41,10 @@ export type HubAdminApi = {
   createSpace(name: string, members: HubSpaceMember[]): Promise<HubSpaceInfo>;
   updateSpace(id: string, p: { name?: string; members?: HubSpaceMember[] }): Promise<void>;
   deleteSpace(id: string): Promise<void>;
+  /** OWNER only: stores the GitHub App's webhook secret (and its slug, when known) on the hub. The hub never returns the secret. */
+  setGithubWebhook(secret: string, appSlug?: string | null): Promise<void>;
+  /** OWNER only: removes the secret and slug; the hub's webhook endpoint answers 404 again. */
+  clearGithubWebhook(): Promise<void>;
   logout(): Promise<void>;
 };
 

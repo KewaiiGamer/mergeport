@@ -1,5 +1,5 @@
 import { ValidationError } from "@/lib/errors";
-import type { HubAdminApi, HubAdminSpace, HubMember, HubSessionPort, HubSpaceInfo } from "@/lib/hub/ports";
+import type { HubAdminApi, HubAdminSpace, HubMember, HubSessionPort, HubSpaceInfo, HubWebhooks } from "@/lib/hub/ports";
 import { hubSessionPort } from "@/lib/hub/ports-impl";
 
 /**
@@ -8,7 +8,7 @@ import { hubSessionPort } from "@/lib/hub/ports-impl";
  */
 const LOGIN = /^[a-z\d](?:[a-z\d-]{0,38})$/i;
 
-export type HubOverview = { teamName: string; me: HubMember; members: HubMember[]; spaces: HubSpaceInfo[]; canAdmin: boolean };
+export type HubOverview = { teamName: string; me: HubMember; members: HubMember[]; spaces: HubSpaceInfo[]; canAdmin: boolean; webhooks: HubWebhooks };
 
 export class HubTeamService {
   constructor(
@@ -20,7 +20,7 @@ export class HubTeamService {
 
   async overview(): Promise<HubOverview> {
     const r = await this.api.me();
-    return (this.last = { teamName: r.team.name, me: r.member, members: r.members, spaces: r.spaces, canAdmin: r.member.role === "OWNER" || r.member.role === "ADMIN" });
+    return (this.last = { teamName: r.team.name, me: r.member, members: r.members, spaces: r.spaces, canAdmin: r.member.role === "OWNER" || r.member.role === "ADMIN", webhooks: r.webhooks });
   }
 
   // Local checks are UX only. A cached "no" is re-checked against the hub once, so a promotion is never blocked here.
@@ -113,6 +113,25 @@ export class HubTeamService {
     await this.requireAdmin("delete spaces");
     if (opts.confirmed !== true) throw new ValidationError("Deleting this space removes its projects, cards and tasks from every member's computer.");
     await this.mutate(() => this.api.deleteSpace(id));
+  }
+
+  /** Stores the GitHub App's webhook secret on the hub. OWNER only (the hub re-checks); the secret is validated here and never echoed in an error. */
+  async setGithubWebhook(secret: string, appSlug?: string | null): Promise<void> {
+    await this.requireOwner("set up instant GitHub updates");
+    if (secret.length < 32 || secret.length > 256) throw new ValidationError("The secret must be 32 to 256 characters.");
+    if (appSlug && !/^[A-Za-z0-9-]{1,100}$/.test(appSlug)) throw new ValidationError("The App's slug may only contain letters, digits and hyphens.");
+    await this.mutate(() => this.api.setGithubWebhook(secret, appSlug || undefined));
+  }
+
+  async clearGithubWebhook(): Promise<void> {
+    await this.requireOwner("turn off instant GitHub updates");
+    await this.mutate(() => this.api.clearGithubWebhook());
+  }
+
+  private async requireOwner(what: string): Promise<HubOverview> {
+    const o = await this.overview();
+    if (o.me.role !== "OWNER") throw new ValidationError(`Only the owner can ${what}.`);
+    return o;
   }
 
   /** Ends the session on the hub (a down hub does not block it), then forgets it locally. */

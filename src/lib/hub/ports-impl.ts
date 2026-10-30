@@ -1,6 +1,6 @@
 import path from "node:path";
 import { createPrisma, resolveDbFile, type Db } from "@/lib/db";
-import { HubForbidden, HubRequestError, HubUnauthorized, type HubAdminApi, type HubAdminSpace, type HubLinkStatus, type HubMember, type HubSessionPort } from "@/lib/hub/ports";
+import { HubForbidden, HubRequestError, HubUnauthorized, type HubAdminApi, type HubAdminSpace, type HubLinkStatus, type HubMember, type HubSessionPort, type HubWebhooks } from "@/lib/hub/ports";
 import { clearHubSession, loadHubSession, openVault, saveHubSession } from "@/lib/hub/session-vault";
 import type { HubLinkState } from "@/lib/hub/link";
 
@@ -58,6 +58,13 @@ export function parseAdminSpaces(raw: unknown): HubAdminSpace[] {
   return out;
 }
 
+/** `/me.webhooks`. A hub without webhooks omits it, and a malformed value reads as "off": the panel never trusts it further than that. */
+export function parseWebhooks(raw: unknown): HubWebhooks {
+  const w = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+  const str = (v: unknown) => (typeof v === "string" && v ? v : null);
+  return { enabled: w.enabled === true, appSlug: str(w.appSlug), lastDeliveryAt: str(w.lastDeliveryAt), lastEvent: str(w.lastEvent) };
+}
+
 /** HTTP admin client against hub/src/{auth-routes,admin-routes}.ts. Errors never carry the token or the response body. */
 export function httpHubAdmin(origin: string, token: () => Promise<string | null>, fetchImpl: typeof fetch = fetch): HubAdminApi {
   const call = async (method: string, p: string, body?: unknown): Promise<unknown> => {
@@ -89,7 +96,12 @@ export function httpHubAdmin(origin: string, token: () => Promise<string | null>
   const seg = encodeURIComponent;
   return {
     // GET /me -> { member, team: { id, name }, members, spaces: [{ id, kind, name, canWrite, seq }] }
-    me: async () => (await call("GET", "/me")) as Awaited<ReturnType<HubAdminApi["me"]>>,
+    // `webhooks: { enabled, appSlug, lastDeliveryAt, lastEvent }` was added later; a hub without it reads as "off".
+    me: async () => {
+      const r = (await call("GET", "/me")) as (Omit<Awaited<ReturnType<HubAdminApi["me"]>>, "webhooks"> & { webhooks?: unknown }) | null;
+      if (!r) throw new HubRequestError("The server sent an unreadable answer", 200);
+      return { ...r, webhooks: parseWebhooks(r.webhooks) };
+    },
     // POST /admin/invites { githubLogin, role } -> 201 { invite }
     invite: async (login, role) => void (await call("POST", "/admin/invites", { githubLogin: login, role })),
     // DELETE /admin/members/:githubId -> 204
@@ -117,6 +129,10 @@ export function httpHubAdmin(origin: string, token: () => Promise<string | null>
     updateSpace: async (id, p) => void (await call("PATCH", `/admin/spaces/${seg(id)}`, p)),
     // DELETE /admin/spaces/:id -> 204
     deleteSpace: async (id) => void (await call("DELETE", `/admin/spaces/${seg(id)}`)),
+    // PUT /admin/github-webhook { secret, appSlug? } -> 204 (OWNER). The secret is only ever sent, never read back or logged.
+    setGithubWebhook: async (secret, appSlug) => void (await call("PUT", "/admin/github-webhook", appSlug ? { secret, appSlug } : { secret })),
+    // DELETE /admin/github-webhook -> 204 (OWNER)
+    clearGithubWebhook: async () => void (await call("DELETE", "/admin/github-webhook")),
     // POST /auth/logout -> 204
     logout: async () => void (await call("POST", "/auth/logout")),
   };
