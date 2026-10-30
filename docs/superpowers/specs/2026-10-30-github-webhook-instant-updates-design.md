@@ -45,14 +45,14 @@ New `setting` table (`key TEXT PRIMARY KEY, value TEXT NOT NULL`; migration `hub
 
 ### Hub and app over the WebSocket
 
-- Hub to app, per allowed connection, immediately and in arrival order (no coalescing): `{ "t": "gh", "repoId": "<decimal string>", "event": "<event name>", "delivery": "<X-GitHub-Delivery>", "payload": <the parsed JSON body, or null> }`. `payload` is `null` when the raw body is larger than 256 KiB, which makes the app fetch instead.
+- Hub to app, per allowed connection, immediately and in the order the request bodies finish arriving (no coalescing; apps never write older data over newer, by `updated_at`): `{ "t": "gh", "repoId": "<decimal string>", "event": "<event name>", "delivery": "<X-GitHub-Delivery>", "payload": <the parsed JSON body, or null> }`. `payload` is `null` when the raw body is larger than 256 KiB, which makes the app fetch instead.
 - App to hub: `{ "t": "watch", "repos": ["<decimal string>", ...] }` replaces the connection's watched set (at most 2000 ids, extra ignored); sent after `hello` and whenever the tracked set changes; held in memory per connection.
 
 ### Who receives a relay (the audience rule)
 
 A connection receives it for repository R only if it watches R and its member is allowed:
 1. R is public (`repository.private` false), or
-2. the member's login equals `repository.owner.login` (case-insensitive), or
+2. the member's GitHub numeric id equals `repository.owner.id` (logins can be renamed and reused, ids cannot); only when the payload has no numeric owner id does the case-insensitive match of `repository.owner.login` apply, or
 3. R is shared through a space the member can read: some non-deleted `entity` row of type `repo`, in a space where `spaceAccess(member).canRead` is true, has `data.githubId` equal to R's id.
 Otherwise nothing is sent; that member's app covers it on the 15-minute cycle.
 
@@ -79,7 +79,7 @@ Otherwise nothing is sent; that member's app covers it on the 15-minute cycle.
 4. Fallback events: `pull_request_review`, `pull_request_review_thread`, `check_run`, `check_suite`, `status`, `push`, `create`, `delete`, review-request actions, and any direct-apply event that failed the checks in step 2.
 5. After a direct apply, emit `notifyChange("pulled")` so `LiveRefresh` redraws within about 0.6 s.
 
-**Fallback = repository refresher:** coalesce per repository for 1500 ms; one refresh at a time per repository; at most one per repository every 5 s (a request inside that window is delayed to its end, not dropped); the refresh is the same service call the Repositories page's Refresh button uses; its completion emits `notifyChange("pulled")`.
+**Fallback = repository refresher:** coalesce per repository for 1500 ms; one refresh at a time per repository; at most one per repository every 5 s for item events and every 30 s for `check_run`, `check_suite`, `status`, `push`, `create`, `delete` (a request inside that window is delayed to its end, not dropped); the refresh is the `sync.repository` job the Repositories page's Refresh button queues, run immediately and awaited until DONE or FAILED (2 minute limit); the job's successful completion emits `notifyChange("pulled")`. Direct applies are serialised per repository and each event's writes are one transaction.
 
 A malformed event never throws out of the message handler and never blocks later ones.
 
@@ -87,7 +87,7 @@ A malformed event never throws out of the message handler and never blocks later
 
 GitHub's manifest flow lets the form create the App with one confirmation click. No password or admin token is involved.
 
-Local routes under `/api/local/hub/github-app/`, with the same guards as the other hub routes (loopback Host, session cookie, hub session present); `start` also requires the hub role OWNER, checked through the hub's `/me`:
+Local routes under `/api/local/hub/github-app/`. `start` has the same guards as the other hub routes (loopback Host, same-origin POST, session cookie, hub session present) and requires the hub role OWNER, checked through the hub's `/me`; it also sets a `SameSite=Lax`, `HttpOnly` nonce cookie (`mp_gh_app`, path `/api/local/hub/github-app/`, 15 minutes) whose value is stored in the state entry with the starting member's id. `callback` is a top-level cross-site GET from github.com, and the session cookie is `SameSite=Strict`, so browsers do not send it there: the callback is guarded instead by the loopback Host with the exact port, the single-use `state`, the nonce cookie matching the state entry, and a fresh check that the hub's current OWNER is the member who started the flow. It answers `200` with a small HTML page that meta-refreshes to `/team?github-app=...` (a same-site navigation that carries the session cookie) instead of a `Location` redirect. The Content-Security-Policy `form-action` is widened only to `https://github.com/settings/apps/new` and `https://github.com/organizations/`, for the hidden manifest form.
 - `POST start` with `{ "account": "personal" }` or `{ "account": "org", "org": "<login>" }`, `{ "contents": boolean }` and `{ "teammates": boolean }` returns `{ actionUrl, manifest, state }`. `actionUrl` is `https://github.com/settings/apps/new?state=<state>` or `https://github.com/organizations/<org>/settings/apps/new?state=<state>`. `state` is 32 random bytes (base64url) kept in memory with the hub origin and a 15-minute expiry, single use. The page submits a hidden form (`method=post`, one field `manifest`) to `actionUrl` as a top-level navigation.
 - `GET callback?code=<code>&state=<state>`: requires a known, unexpired, unused `state` (otherwise a plain error page with a link to Team and no call to GitHub). Then `POST https://api.github.com/app-manifests/<code>/conversions` with no auth and a 15 s timeout. It keeps only `webhook_secret` and `slug`; `pem`, `client_secret`, `client_id`, `id` are dropped immediately, never stored, logged or forwarded. It calls the hub `PUT /admin/github-webhook { secret, appSlug }` with the owner's session and redirects to `/team?github-app=created`. Any failure redirects to `/team?github-app=failed&reason=<short code>`; no secret appears in any URL.
 
