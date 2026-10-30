@@ -144,7 +144,7 @@ describe("the live link: relayed GitHub events", () => {
     expect(refreshed).toEqual([]); // waits for the 1500 ms window
     timers.advance(1500);
     await vi.waitFor(() => expect(refreshed).toEqual([r.id]));
-    await vi.waitFor(() => expect(notified).toBe(1)); // the refresh's completion redraws
+    expect(notified).toBe(0); // the redraw comes from the sync job's handler when it really finishes, not from queueing it
   });
 
   it("ignores events for a repository that is no longer tracked", async () => {

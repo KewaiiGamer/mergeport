@@ -171,7 +171,12 @@ describe("HubLink: GitHub relays and watch", () => {
     expect(t.last().sent).toEqual([]);
     expect(t.link.isOpen).toBe(false);
     t.last().open();
+    t.link.watch(["1"]); // socket open but no hello yet: still nothing
+    expect(t.link.isOpen).toBe(false);
+    expect(t.last().sent).toEqual([]);
+    t.last().msg({ t: "hello", spaces: [] });
     expect(t.link.isOpen).toBe(true);
+    t.last().sent.length = 0;
     const s = t.last();
     s.drop();
     expect(t.link.isOpen).toBe(false);
@@ -187,6 +192,7 @@ describe("HubLink: GitHub relays and watch", () => {
     t.link.start();
     await flush();
     t.last().open();
+    t.last().msg({ t: "hello", spaces: [] });
     t.last().send = () => {
       throw new Error("closed");
     };

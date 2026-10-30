@@ -155,7 +155,6 @@ describe("direct apply writes what the full sync writes", () => {
 
   it.each([
     ["issue_comment-created-issue", "issue_comment-created-issue", 7],
-    ["issue_comment-created-pr", "issue_comment-created-pr", 12],
   ])("%s stores the same comment row and creates the missing work item", async (name, _n, number) => {
     const { log, deps: d } = deps();
     const e = relay(name);
@@ -176,6 +175,7 @@ describe("direct apply writes what the full sync writes", () => {
     ["pull request", "issue_comment-created-pr", "issue_comment-edited-pr", "issue_comment-deleted-pr", 12],
   ])("issue_comment created, edited, deleted on a %s", async (_label, created, edited, deleted, number) => {
     const { deps: d } = deps();
+    if (number === 12) await handleGithubEvent(db, relay("pull_request-opened"), d); // a pull request row comes from a pull_request event
     await handleGithubEvent(db, relay(created), d);
     const first = await db.workItemComment.findMany();
     expect(first).toHaveLength(1);
@@ -329,7 +329,7 @@ describe("fallback", () => {
 
   it("a failing write falls back to a refresh", async () => {
     const { log, deps: d } = deps();
-    const failing = new Proxy(db, { get: (t, k) => (k === "workItem" ? { ...t.workItem, findUnique: () => Promise.reject(new Error("locked")) } : (t as never)[k]) }) as Db;
+    const failing = new Proxy(db, { get: (t, k) => (k === "$transaction" ? () => Promise.reject(new Error("locked")) : (t as never)[k]) }) as Db;
     await handleGithubEvent(failing, relay("issues-opened"), d);
     expect(log.refreshed).toEqual([repoId]);
   });
@@ -390,5 +390,108 @@ describe("which events are applied", () => {
     expect(log.notified).toBe(2);
     await handleGithubEvent(db, { repoId: REPO_ID, event: "check_run", delivery: "c1", payload: {} }, d);
     expect(log.notified).toBe(2);
+  });
+});
+
+describe("review findings", () => {
+  const rowsWritten = async () => (await items()).length + (await db.workItemComment.count());
+
+  it("an issue_comment on a pull request with no local row falls back: no PULL_REQUEST row is made from issue-shaped data", async () => {
+    const { log, deps: d } = deps();
+    await handleGithubEvent(db, relay("issue_comment-created-pr"), d);
+    expect(log.refreshed).toEqual([repoId]);
+    expect(await rowsWritten()).toBe(0);
+    // with the pull request already known the comment is applied directly
+    await handleGithubEvent(db, relay("pull_request-opened"), d);
+    await handleGithubEvent(db, relay("issue_comment-created-pr"), d);
+    expect(await db.workItemComment.count()).toBe(1);
+    expect(await items()).toHaveLength(1);
+  });
+
+  it("events of one repository are applied in arrival order even when delivered together: newer then older keeps the newer", async () => {
+    const { deps: d } = deps();
+    await Promise.all([handleGithubEvent(db, relay("issues-edited"), d), handleGithubEvent(db, relay("issues-opened"), d)]);
+    expect(await one(7)).toMatchObject({ title: "Crash when the config file is empty (v1.1)" });
+    await Promise.all([handleGithubEvent(db, relay("pull_request-closed-merged"), d), handleGithubEvent(db, relay("pull_request-synchronize"), d), handleGithubEvent(db, relay("pull_request-opened"), d)]);
+    expect(await one(12)).toMatchObject({ state: "MERGED", headSha: "2".repeat(40) });
+  });
+
+  it("the write itself is order-safe: two interleaved writers, newer then older, leave the newer row", async () => {
+    const { applyWorkItem } = await import("@/lib/sync/repository");
+    const { OctokitPort } = await import("@/lib/github/octokit");
+    const newer = OctokitPort.toWorkItem(webhook("issues-edited").payload.issue);
+    const older = OctokitPort.toWorkItem(webhook("issues-opened").payload.issue);
+    const [a, b] = await Promise.all([applyWorkItem(db, repoId, newer, undefined, { partial: true }), applyWorkItem(db, repoId, older, undefined, { partial: true })]);
+    expect(await one(7)).toMatchObject({ title: newer.title });
+    expect([a, b].filter(Boolean).length).toBeGreaterThanOrEqual(1);
+    // and a stale writer that read "no row" before the newer one was created cannot overwrite it
+    expect(await applyWorkItem(db, repoId, older, undefined, { partial: true })).toBe(false);
+  });
+
+  it("a comment deleted by a later event that arrived first is not brought back by an earlier created or edited", async () => {
+    const { deps: d } = deps();
+    await handleGithubEvent(db, relay("issues-opened"), d);
+    await handleGithubEvent(db, relay("issue_comment-deleted-issue"), d);
+    await handleGithubEvent(db, relay("issue_comment-created-issue"), d);
+    await handleGithubEvent(db, relay("issue_comment-edited-issue"), d);
+    expect(await db.workItemComment.count()).toBe(0);
+  });
+
+  it("an event handled after a failing one still runs (errors are isolated in the queue)", async () => {
+    const { log, deps: d } = deps();
+    const failing = new Proxy(db, { get: (t, k) => (k === "$transaction" ? () => Promise.reject(new Error("locked")) : (t as never)[k]) }) as Db;
+    await Promise.all([handleGithubEvent(failing, relay("issues-opened"), d), handleGithubEvent(db, relay("issues-edited"), d)]);
+    expect(log.refreshed).toEqual([repoId]);
+    expect((await one(7)).title).toContain("(v1.1)");
+  });
+
+  it("one event's writes are atomic: a failure after the work item was written leaves nothing behind", async () => {
+    const { log, deps: d } = deps();
+    const broken = new Proxy(db, {
+      get: (t, k) =>
+        k === "$transaction"
+          ? (fn: (tx: unknown) => Promise<unknown>) => t.$transaction((tx) => fn(new Proxy(tx, { get: (x, kk) => (kk === "workItemComment" ? { ...x.workItemComment, updateMany: () => Promise.reject(new Error("disk")) } : (x as never)[kk]) })))
+          : (t as never)[k],
+    }) as Db;
+    await handleGithubEvent(broken, relay("pull_request_review_comment-created"), d);
+    expect(await rowsWritten()).toBe(0);
+    expect(log.refreshed).toEqual([repoId]);
+    expect(log.notified).toBe(0);
+  });
+
+  it("a demo repository is ignored", async () => {
+    const { log, deps: d } = deps();
+    await db.repository.update({ where: { id: repoId }, data: { isDemo: true } });
+    await handleGithubEvent(db, relay("issues-opened"), d);
+    expect(log.notified + log.refreshed.length).toBe(0);
+  });
+
+  const unsafe: [string, string, (p: any) => void][] = [
+    ["issue id a float", "issues-opened", (p) => (p.issue.id = 1.5)],
+    ["issue number huge", "issues-opened", (p) => (p.issue.number = 2 ** 60)],
+    ["comment id a float", "issue_comment-created-issue", (p) => (p.comment.id = 9000001.5)],
+    ["review comment line a float", "pull_request_review_comment-created", (p) => (p.comment.line = 13.5)],
+    ["in_reply_to_id huge", "pull_request_review_comment-created", (p) => (p.comment.in_reply_to_id = 1e30)],
+    ["additions a float", "pull_request-opened", (p) => (p.pull_request.additions = 1.5)],
+    ["changed_files huge", "pull_request-opened", (p) => (p.pull_request.changed_files = 2 ** 60)],
+    ["label color a number", "issues-opened", (p) => (p.issue.labels = [{ name: "bug", color: 5 }])],
+    ["user avatar_url a number", "issues-opened", (p) => (p.issue.user.avatar_url = 5)],
+    ["issue deleted", "issues-opened", (p) => (p.action = "deleted")],
+    ["issue transferred", "issues-opened", (p) => (p.action = "transferred")],
+  ];
+  it.each(unsafe)("%s falls back without throwing and writes nothing", async (_l, name, patch) => {
+    const { log, deps: d } = deps();
+    await expect(handleGithubEvent(db, relay(name, { patch }), d)).resolves.toBeUndefined();
+    expect(log.refreshed).toEqual([repoId]);
+    expect(await rowsWritten()).toBe(0);
+  });
+
+  it("check, status and branch events ask for a bulk refresh, item events for a normal one", async () => {
+    const kinds: string[] = [];
+    const d = { refresh: (_id: string, kind: string) => void kinds.push(kind) };
+    for (const ev of ["check_run", "check_suite", "status", "push", "create", "delete"]) await handleGithubEvent(db, { repoId: REPO_ID, event: ev, delivery: `b-${ev}`, payload: {} }, d);
+    await handleGithubEvent(db, { repoId: REPO_ID, event: "pull_request_review", delivery: "b-rev", payload: {} }, d);
+    await handleGithubEvent(db, relay("issues-opened", { payload: null }), d);
+    expect(kinds).toEqual(["bulk", "bulk", "bulk", "bulk", "bulk", "bulk", "item", "item"]);
   });
 });

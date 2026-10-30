@@ -114,6 +114,54 @@ describe("repository refresher (fallback for events that are not applied from th
     expect(t.started.map((s) => s[1])).toEqual([1500, 13000]);
   });
 
+  it("bulk events (checks, pushes) use a 30 s gap, and a bulk request widens an already scheduled refresh", async () => {
+    const t = setup();
+    t.r.request("r1", "bulk");
+    t.timers.advance(1500);
+    await flush();
+    t.timers.advance(500);
+    t.r.request("r1", "bulk"); // at 2000: not before 1500 + 30000
+    t.timers.advance(29_000);
+    await flush();
+    expect(t.started).toHaveLength(1);
+    t.timers.advance(1000);
+    await flush();
+    expect(t.started.map((s) => s[1])).toEqual([1500, 31_500]);
+    // an item request already scheduled at the 5 s gap is pushed out when a bulk one joins it
+    t.timers.advance(1000); // 32500
+    t.r.request("r1", "item");
+    t.timers.advance(100);
+    t.r.request("r1", "bulk");
+    t.timers.advance(5000);
+    await flush();
+    expect(t.started).toHaveLength(2);
+    t.timers.advance(30_000);
+    await flush();
+    expect(t.started.map((s) => s[1])).toEqual([1500, 31_500, 61_500]);
+  });
+
+  it("the gap measures the real duration: a refresh that is still running holds the next one back", async () => {
+    let release: () => void = () => {};
+    let runs = 0;
+    const t = setup(() => {
+      runs++;
+      return new Promise<void>((r) => (release = r));
+    });
+    t.r.request("r1");
+    t.timers.advance(1500);
+    await flush();
+    t.timers.advance(10 * 60_000); // 10 minutes of waiting on a job
+    t.r.request("r1");
+    t.timers.advance(60_000);
+    await flush();
+    expect(runs).toBe(1);
+    release();
+    await flush();
+    t.timers.advance(5_000);
+    await flush();
+    expect(runs).toBe(2);
+  });
+
   it("a failing refresh does not stop later ones and does not throw", async () => {
     let n = 0;
     const t = setup(async () => {
