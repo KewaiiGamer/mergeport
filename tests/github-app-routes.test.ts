@@ -10,7 +10,7 @@ import { rememberAppState, resetAppStates } from "@/lib/hub/github-app-state";
 import { useConversionFetch } from "@/lib/hub/github-app-conversion";
 import { FAKE_SESSION, startFakeHub, type FakeMember } from "./fake-hub";
 
-const m = vi.hoisted(() => ({ backend: "github", svc: null as unknown, origin: null as string | null, viewer: true }));
+const m = vi.hoisted(() => ({ backend: "github", svc: null as unknown, origin: null as string | null, viewer: true, nonce: "" }));
 vi.mock("@/lib/auth/current", () => ({ getAuth: async () => (m.viewer ? { viewer: { login: "boss" } } : null) }));
 vi.mock("@/lib/local/workspaces", () => ({ currentBackend: async () => m.backend }));
 vi.mock("@/lib/local/runtime", () => ({ getHubTeamService: async () => ({ svc: m.svc, dbFile: "x.db", origin: m.origin }) }));
@@ -50,10 +50,14 @@ async function hub(actor = "1") {
 const HOST = "127.0.0.1:3000";
 const startReq = (body: unknown, headers: Record<string, string> = { origin: `http://${HOST}` }) =>
   new Request(`http://${HOST}/api/local/hub/github-app/start`, { method: "POST", headers: { host: HOST, "content-type": "application/json", ...headers }, body: JSON.stringify(body) });
-const cbReq = (q: Record<string, string>, headers: Record<string, string> = {}) =>
+const cbReq = (q: Record<string, string>, headers: Record<string, string> = { cookie: `mp_gh_app=${m.nonce}` }) =>
   new Request(`http://${HOST}/api/local/hub/github-app/callback?${new URLSearchParams(q)}`, { headers: { host: HOST, ...headers } });
 type StartAnswer = { actionUrl: string; manifest: { name: string; url: string; public: boolean; hook_attributes: { url: string }; redirect_url: string; default_permissions: Record<string, string>; default_events: string[] }; state: string };
-const begin = async (body: unknown = { account: "personal", contents: false, teammates: true }) => (await (await start(startReq(body))).json()) as StartAnswer;
+const begin = async (body: unknown = { account: "personal", contents: false, teammates: true }) => {
+  const r = await start(startReq(body));
+  m.nonce = /mp_gh_app=([^;]+)/.exec(r.headers.get("set-cookie") ?? "")?.[1] ?? "";
+  return (await r.json()) as StartAnswer;
+};
 /** The callback answers a page whose meta refresh goes to /team; this is where the browser lands. */
 const landing = async (r: Response) => /http-equiv="refresh" content="0;url=([^"]+)"/.exec(await r.text())?.[1] ?? null;
 
@@ -161,7 +165,7 @@ describe("callback", () => {
   it("refuses a Host that is not this loopback server before looking at the state", async () => {
     await hub();
     const { state } = await begin();
-    for (const host of ["evil.example", "127.0.0.1:3001"]) expect((await callback(cbReq({ code: CODE, state }, { host }))).status).toBe(403);
+    for (const host of ["evil.example", "127.0.0.1:3001"]) expect((await callback(cbReq({ code: CODE, state }, { host, cookie: `mp_gh_app=${m.nonce}` }))).status).toBe(403);
     // the state was not spent by the refused requests
     const gh = fakeGithub();
     useConversionFetch(gh.f);
@@ -172,7 +176,7 @@ describe("callback", () => {
     await hub();
     useConversionFetch(fakeGithub().f);
     const { state } = await begin();
-    const r = await callback(cbReq({ code: CODE, state }, { "sec-fetch-site": "cross-site", referer: "https://github.com/" }));
+    const r = await callback(cbReq({ code: CODE, state }, { cookie: `mp_gh_app=${m.nonce}`, "sec-fetch-site": "cross-site", referer: "https://github.com/" }));
     expect(r.status).toBe(200);
     expect(await landing(r)).toBe("/team?github-app=created");
   });
@@ -233,14 +237,56 @@ describe("callback", () => {
     expect(h.webhook.secret).toBeNull();
   });
 
-  it("a hub that refuses the secret fails with a reason, and no secret reaches the URL", async () => {
-    // A state only exists after an owner's `start`; here the person was demoted in between, so the hub says MEMBER.
+  it("sets an HttpOnly, SameSite=Lax nonce cookie scoped to the github-app routes for 15 minutes", async () => {
+    await hub();
+    const r = await start(startReq({ account: "personal" }));
+    const c = r.headers.get("set-cookie") ?? "";
+    expect(c).toMatch(/^mp_gh_app=[A-Za-z0-9_-]{43};/);
+    expect(c).toMatch(/HttpOnly/i);
+    expect(c).toMatch(/SameSite=lax/i);
+    expect(c).toContain("Path=/api/local/hub/github-app/");
+    expect(c).toMatch(/Max-Age=900/i);
+    expect(c).not.toContain((await r.json()).state);
+  });
+
+  it("a missing or wrong nonce cookie answers the unknown-state page, consumes the state and calls nothing", async () => {
+    const h = await hub();
+    const gh = fakeGithub();
+    useConversionFetch(gh.f);
+    for (const cookie of [undefined, "mp_gh_app=wrong", "other=1", `mp_gh_app=${"x".repeat(43)}`]) {
+      const { state } = await begin();
+      const good = m.nonce;
+      const r = await callback(cbReq({ code: CODE, state }, cookie ? { cookie } : {}));
+      expect(r.status).toBe(400);
+      expect(await r.text()).toContain('href="/team"');
+      // the state is spent: even the right cookie no longer works
+      expect((await callback(cbReq({ code: CODE, state }, { cookie: `mp_gh_app=${good}` }))).status).toBe(400);
+    }
+    expect(gh.requests).toHaveLength(0);
+    expect(h.requests.some((x) => x.path === "/admin/github-webhook")).toBe(false);
+  });
+
+  it("a different member (the hub's owner changed, or a demotion) is refused before GitHub is called", async () => {
+    const h = await hub();
+    const gh = fakeGithub();
+    useConversionFetch(gh.f);
+    const { state } = await begin();
+    // same hub, but the current owner is now someone else
+    const real = httpHubAdmin(h.origin, async () => FAKE_SESSION);
+    m.svc = new HubTeamService({ ...real, me: async () => { const r = await real.me(); return { ...r, member: { ...r.member, githubId: "9" } }; } }, "9");
+    const r = await callback(cbReq({ code: CODE, state }));
+    expect(r.status).toBe(400);
+    expect(gh.requests).toHaveLength(0);
+    expect(h.webhook.secret).toBeNull();
+  });
+
+  it("a person demoted after starting is refused before GitHub is called", async () => {
     const h = await hub("3");
-    useConversionFetch(fakeGithub().f);
-    const state = rememberAppState(h.origin);
-    const to = await landing(await callback(cbReq({ code: CODE, state })));
-    expect(to).toBe("/team?github-app=failed&reason=owner");
-    expect(to).not.toContain(WEBHOOK_SECRET);
+    const gh = fakeGithub();
+    useConversionFetch(gh.f);
+    const state = rememberAppState(h.origin, "1", "n0nce");
+    expect((await callback(cbReq({ code: CODE, state }, { cookie: "mp_gh_app=n0nce" }))).status).toBe(400);
+    expect(gh.requests).toHaveLength(0);
     expect(h.webhook.secret).toBeNull();
   });
 

@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { getAuth } from "@/lib/auth/current";
 import { env } from "@/lib/env";
 import { buildManifest, GITHUB_LOGIN, manifestActionUrl } from "@/lib/hub/github-app-manifest";
-import { rememberAppState } from "@/lib/hub/github-app-state";
+import { APP_COOKIE_PATH, APP_NONCE_COOKIE, APP_STATE_TTL_MS, newNonce, rememberAppState } from "@/lib/hub/github-app-state";
 import { guardConnect, readBody } from "@/lib/hub/connect-route";
 import { HubForbidden, HubRequestError, HubUnauthorized } from "@/lib/hub/ports";
 import { isHubBackend } from "@/lib/local/backends";
@@ -36,9 +36,12 @@ export async function POST(req: Request) {
     if (!origin) return refuse("Sign in to the server again.", 401);
     const overview = await svc.overview();
     if (overview.me.role !== "OWNER") return refuse("Only the owner of the server can create the GitHub App.", 403);
-    const state = rememberAppState(origin);
+    const nonce = newNonce();
+    const state = rememberAppState(origin, overview.me.githubId, nonce);
     const manifest = buildManifest({ teamName: overview.teamName, hubOrigin: origin, port: env().MERGEPORT_PORT, teammates, contents });
-    return NextResponse.json({ actionUrl: manifestActionUrl(account, state), manifest, state });
+    const res = NextResponse.json({ actionUrl: manifestActionUrl(account, state), manifest, state });
+    res.cookies.set(APP_NONCE_COOKIE, nonce, { httpOnly: true, sameSite: "lax", secure: false, path: APP_COOKIE_PATH, maxAge: APP_STATE_TTL_MS / 1000 });
+    return res;
   } catch (e) {
     if (e instanceof HubUnauthorized) return refuse("Sign in to the server again.", 401);
     if (e instanceof HubForbidden) return refuse("The server refused that.", 403);

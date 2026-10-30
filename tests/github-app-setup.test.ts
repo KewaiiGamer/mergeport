@@ -46,9 +46,9 @@ describe("manifest builder", () => {
 describe("single-use state", () => {
   it("is 32 random bytes (base64url), works once, and remembers the hub origin", () => {
     resetAppStates();
-    const s = rememberAppState("https://h.example");
+    const s = rememberAppState("https://h.example", "1", "n");
     expect(s).toMatch(/^[A-Za-z0-9_-]{43}$/);
-    expect(consumeAppState(s)).toMatchObject({ hubOrigin: "https://h.example" });
+    expect(consumeAppState(s)).toMatchObject({ hubOrigin: "https://h.example", memberId: "1", nonce: "n" });
     expect(consumeAppState(s)).toBeNull();
     expect(consumeAppState("never-issued")).toBeNull();
   });
@@ -57,8 +57,8 @@ describe("single-use state", () => {
     resetAppStates();
     let t = 1_000_000;
     const clock = () => t;
-    const a = rememberAppState("https://h.example", clock);
-    const b = rememberAppState("https://h.example", clock);
+    const a = rememberAppState("https://h.example", "1", "n", clock);
+    const b = rememberAppState("https://h.example", "1", "n", clock);
     t += APP_STATE_TTL_MS - 1;
     expect(consumeAppState(a, clock)).not.toBeNull();
     t += 1;

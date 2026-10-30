@@ -3,7 +3,7 @@ import { isDemo } from "@/lib/env";
 import { ValidationError } from "@/lib/errors";
 import { loopbackHost } from "@/lib/http";
 import { convertManifest, ConversionError } from "@/lib/hub/github-app-conversion";
-import { consumeAppState } from "@/lib/hub/github-app-state";
+import { APP_NONCE_COOKIE, consumeAppState, cookieValue, sameNonce } from "@/lib/hub/github-app-state";
 import { HubForbidden, HubUnauthorized } from "@/lib/hub/ports";
 import { isHubBackend } from "@/lib/local/backends";
 import { getHubTeamService } from "@/lib/local/runtime";
@@ -17,8 +17,10 @@ import { currentBackend } from "@/lib/local/workspaces";
  * from any navigation that starts cross-site (and from the rest of a redirect chain that began there). Requiring either would
  * break the feature. The protection is instead (1) the loopback Host with this server's exact port, which stops DNS rebinding,
  * (2) the 256-bit `state`, which only an authenticated, OWNER-checked `start` call can create, which is single use and expires
- * after 15 minutes, so a forged or replayed callback is refused before any request leaves this computer, and (3) the hub
- * session, which lives on this computer and is used for the one PUT, never taken from the request.
+ * after 15 minutes, so a forged or replayed callback is refused before any request leaves this computer, (3) a nonce cookie
+ * (HttpOnly, SameSite=Lax, which browsers DO send on a top-level GET from another site) set by `start` and stored in the state
+ * entry, so only the browser that started the flow can finish it, together with a re-check that the hub's current OWNER is the
+ * member who started it, and (4) the hub session, which lives on this computer and is used for the one PUT, never taken from the request.
  *
  * Because that cookie is withheld, this route also does not answer with a redirect: the next hop would still be treated as
  * cross-site and arrive without the cookie, ending on the sign-in page. It answers a tiny page whose meta refresh is a
@@ -43,7 +45,8 @@ export async function GET(req: Request) {
   const state = q.get("state");
   // The state is spent here even if a later step fails; the person starts again from the Team page.
   const entry = state ? consumeAppState(state) : null;
-  if (!entry || !code) return page(400, "Mergeport", "This GitHub App link is not valid any more. Go back to Team and start again.", "/team");
+  // The state is bound to the browser that started it: the Lax nonce cookie set by `start` (sent on this top-level GET) must match.
+  if (!entry || !code || !sameNonce(cookieValue(req, APP_NONCE_COOKIE), entry.nonce)) return page(400, "Mergeport", "This GitHub App link is not valid any more. Go back to Team and start again.", "/team");
 
   const backend = await currentBackend();
   if (!isHubBackend(backend)) return done("failed", "hub");
@@ -51,6 +54,9 @@ export async function GET(req: Request) {
   try {
     const { svc, origin } = await getHubTeamService(backend);
     if (origin !== entry.hubOrigin) return done("failed", "hub");
+    // The hub's current OWNER must still be the member who pressed the button, checked before anything goes to GitHub.
+    const me = (await svc.overview()).me;
+    if (me.role !== "OWNER" || me.githubId !== entry.memberId) return page(400, "Mergeport", "This GitHub App link is not valid any more. Go back to Team and start again.", "/team");
     try {
       conversion = await convertManifest(code);
     } catch (e) {
