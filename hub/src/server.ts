@@ -45,15 +45,16 @@ export function coreRoutes(): Route<HubContext>[] {
 export function createHub(opts: { config: HubConfig; db: HubDb; now?: () => number; log?: Logger; routes?: Route<HubContext>[]; ws?: { silenceMs?: number; coalesceMs?: number } }): Hub {
   let listened = "";
   const now = opts.now ?? Date.now;
+  const log = opts.log ?? createLogger();
   const ctx: HubContext = {
     config: opts.config,
     db: opts.db,
     now,
-    log: opts.log ?? createLogger(),
+    log,
     publicUrl: () => opts.config.publicUrl || listened,
     limiter: createLimiter(now),
     epoch: randomUUID(),
-    notify: createNotifier({ db: opts.db, now, findSession, ...opts.ws }),
+    notify: createNotifier({ db: opts.db, now, findSession, ...opts.ws, log }),
   };
   const routes = [...coreRoutes(), ...(opts.routes ?? [])];
 

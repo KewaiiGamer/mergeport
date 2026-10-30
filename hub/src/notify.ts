@@ -24,6 +24,8 @@ export type NotifierDeps = {
   findSession: typeof findSessionFn;
   silenceMs?: number;
   coalesceMs?: number;
+  /** Socket lifecycle lines (member id, close code, recipient count; never tokens or message bodies). */
+  log?: { info(msg: string, fields?: Record<string, unknown>): void };
 };
 export type Notifier = {
   attach(server: http.Server): void;
@@ -100,10 +102,15 @@ export function createNotifier(deps: NotifierDeps): Notifier {
     const p = pending.get(spaceId);
     pending.delete(spaceId);
     if (!p) return;
+    let sent = 0;
     for (const c of [...conns]) {
       const m = authenticate(c);
-      if (m && spaceAccess(deps.db, m, spaceId).canRead) send(c, { t: "changed", spaceId, seq: p.seq.toString() });
+      if (m && spaceAccess(deps.db, m, spaceId).canRead) {
+        send(c, { t: "changed", spaceId, seq: p.seq.toString() });
+        sent++;
+      }
     }
+    deps.log?.info("ws changed", { spaceId, seq: p.seq.toString(), sockets: conns.size, sent });
   };
 
   const onUpgrade = (req: http.IncomingMessage, socket: Duplex, head: Buffer) => {
@@ -132,8 +139,10 @@ export function createNotifier(deps: NotifierDeps): Notifier {
       const c: Conn = { ws, token, idHash: session.idHash, githubId: member.githubId, silence: null, grace: null };
       conns.add(c);
       armSilence(c);
+      deps.log?.info("ws open", { member: member.githubId.toString(), sockets: conns.size });
       ws.on("error", () => ws.terminate());
-      ws.on("close", () => {
+      ws.on("close", (code) => {
+        deps.log?.info("ws close", { member: member.githubId.toString(), closedWith: code, sockets: conns.size - 1 });
         conns.delete(c);
         if (c.silence) clearTimeout(c.silence);
         if (c.grace) clearTimeout(c.grace);
